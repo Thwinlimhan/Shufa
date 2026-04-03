@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api.rate_limit import enforce_rate_limit
-from backend.api.routes import approvals, auth, backtests, data, execution, ops, paper, strategies, vault
+from backend.api.routes import approvals, auth, backtests, data, execution, ops, paper, research, strategies, vault
 from backend.api.schemas import HealthResponse
 from backend.auth.service import bootstrap_users
 from backend.core.config import settings
@@ -68,6 +68,7 @@ app.include_router(approvals.router, prefix="/approvals", tags=["approvals"])
 app.include_router(execution.router, prefix="/execution", tags=["execution"])
 app.include_router(ops.router, prefix="/ops", tags=["ops"])
 app.include_router(vault.router, prefix="/vault", tags=["vault"])
+app.include_router(research.router, prefix="/research", tags=["research"])
 
 
 @app.get("/health", response_model=HealthResponse, summary="Service health")

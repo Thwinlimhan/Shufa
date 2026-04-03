@@ -13,7 +13,7 @@ from backend.ops.alerts import notify_event
 from backend.ops.audit import record_paper_cycle_event
 from backend.ops.metrics import TRADE_EVENTS
 from backend.paper.broker import close_position, fill_order, open_position, submit_order, update_unrealized_pnl
-from backend.strategy.engine import get_signal
+from backend.strategy.engine import get_signal_with_position
 from backend.strategy.targets import instrument_for_target, list_active_paper_targets
 
 
@@ -32,8 +32,9 @@ def run_bar(current_bar: dict) -> None:
             "venue": target_inst.venue.value,
             "timeframe": current_bar["timeframe"],
         }
-        signal = get_signal(spec, current_bar)
         positions = _get_open_positions(spec.spec_id, target_inst)
+        current_direction = positions[0]["direction"] if positions else None
+        signal = get_signal_with_position(spec, current_bar, current_direction=current_direction)
         close_price = float(current_bar["close"])
         if not settings.paper_trading_enabled:
             _log_cycle_event(target_key, "skipped", "paper_trading_disabled", {"signal": signal})

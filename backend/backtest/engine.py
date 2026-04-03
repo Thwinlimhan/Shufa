@@ -14,6 +14,54 @@ from backend.core.types import BacktestConfig, BacktestResult, EquityPoint, Stra
 from backend.strategy.engine import get_signal
 
 
+def _resolve_backtest_size(
+    spec: StrategySpec,
+    row: dict,
+    capital: float,
+) -> float:
+    """Mirror the sizing logic used by the paper-trading runner."""
+    method = spec.sizing.method
+    fixed = spec.sizing.fixed_notional_usd or 1_000.0
+    if method == "vol_target":
+        target_vol = float(spec.sizing.target_vol or 0.02)
+        realized_vol = max(float(row.get("vol_20") or 0.0), 1e-6)
+        raw_size = capital * (target_vol / realized_vol)
+        cap = capital * spec.sizing.max_position_pct
+        return float(max(100.0, min(raw_size, cap)))
+    if method == "kelly_half":
+        cap = capital * spec.sizing.max_position_pct
+        return float(max(100.0, min(fixed * 1.5, cap)))
+    return float(fixed)
+
+
+def _estimate_funding(
+    row: dict,
+    size_usd: float,
+    direction: str,
+    config: BacktestConfig,
+) -> float:
+    """Estimate funding cost for one bar.
+
+    If ``config.funding_included`` is ``False`` or the bar lacks a
+    ``funding_rate`` column the cost is zero.
+
+    Funding convention:
+    - Positive rate = longs pay shorts.
+    - A long position *pays* ``size * rate``.
+    - A short position *receives* ``size * rate``.
+    """
+    if not config.funding_included:
+        return 0.0
+    rate = float(row.get("funding_rate") or 0.0)
+    if rate == 0.0:
+        return 0.0
+    # For longs a positive rate is a cost (negative PnL).
+    # For shorts a positive rate is income (positive PnL).
+    if direction == "long":
+        return -(size_usd * rate)
+    return size_usd * rate
+
+
 def run_backtest(
     spec: StrategySpec,
     bars: pd.DataFrame,
@@ -29,7 +77,8 @@ def run_backtest(
     current_side = "flat"
     entry_price = 0.0
     entry_ts: datetime | None = None
-    size_usd = spec.sizing.fixed_notional_usd or 1_000.0
+    size_usd = _resolve_backtest_size(spec, {}, capital)
+    accrued_funding = 0.0
     signal_counts = {"long": 0, "short": 0, "flat": 0}
 
     for row in frame.to_dict(orient="records"):
@@ -38,16 +87,22 @@ def run_backtest(
         price = float(row["close"])
         ts = pd.Timestamp(row["ts_open"]).to_pydatetime()
 
+        # Accrue funding each bar while a position is open.
+        if current_side in {"long", "short"}:
+            accrued_funding += _estimate_funding(row, size_usd, current_side, config)
+
         if current_side == "flat" and signal in {"long", "short"}:
             current_side = signal
             entry_price = price
             entry_ts = ts
+            size_usd = _resolve_backtest_size(spec, row, equity)
+            accrued_funding = 0.0
         elif current_side in {"long", "short"} and signal != current_side:
             raw_pnl = ((price - entry_price) / entry_price) * size_usd
             if current_side == "short":
                 raw_pnl = -raw_pnl
             fees = round_trip_cost(size_usd, config.fee_bps, config.slippage_bps)
-            funding = 0.0
+            funding = accrued_funding
             pnl = raw_pnl - fees + funding
             equity += pnl
             trades.append(
@@ -70,6 +125,7 @@ def run_backtest(
             current_side = "flat"
             entry_price = 0.0
             entry_ts = None
+            accrued_funding = 0.0
 
         equity_curve.append(EquityPoint(ts=ts, equity=equity))
 
@@ -81,7 +137,7 @@ def run_backtest(
         if current_side == "short":
             raw_pnl = -raw_pnl
         fees = round_trip_cost(size_usd, config.fee_bps, config.slippage_bps)
-        funding = 0.0
+        funding = accrued_funding
         pnl = raw_pnl - fees + funding
         equity += pnl
         trades.append(

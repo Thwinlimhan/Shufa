@@ -36,12 +36,12 @@ export function DataHealthPage() {
           <button onClick={() => apiPost("/data/ingest", { lookback_days: 30 }).then(() => query.refetch())}>
             Ingest 30d
           </button>
-          <button className="secondary-button" onClick={() => apiPost("/data/funding/ingest", { lookback_days: 14 })}>
+          <button className="secondary-button" onClick={() => apiPost("/data/funding/ingest", { lookback_days: 14 }).then(() => query.refetch())}>
             Ingest Funding
           </button>
           <button
             className="secondary-button"
-            onClick={() => apiPost("/data/market-context/ingest", { lookback_days: 14 })}
+            onClick={() => apiPost("/data/market-context/ingest", { lookback_days: 14 }).then(() => query.refetch())}
           >
             Ingest Context
           </button>

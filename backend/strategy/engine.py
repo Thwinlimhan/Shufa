@@ -46,3 +46,35 @@ def get_signal(spec: StrategySpec, features: dict[str, float]) -> str:
     if spec.entry_short and evaluate_rules(spec.entry_short, features):
         return "short"
     return "flat"
+
+
+def get_signal_with_position(
+    spec: StrategySpec,
+    features: dict[str, float],
+    current_direction: str | None = None,
+) -> str:
+    """Return a trading signal that also respects exit rules.
+
+    When *current_direction* is ``"long"`` or ``"short"`` and the
+    strategy defines ``exit_long`` / ``exit_short`` rules, an exit
+    signal (``"flat"``) is produced when those rules fire — even if
+    entry rules for the *same* side would otherwise keep the position
+    open.
+    """
+    if spec.regime_filters and not evaluate_rules(spec.regime_filters, features):
+        return "flat"
+
+    # Check exit rules first when a position is already open.
+    if current_direction == "long" and spec.exit_long:
+        if evaluate_rules(spec.exit_long, features):
+            return "flat"
+    if current_direction == "short" and spec.exit_short:
+        if evaluate_rules(spec.exit_short, features):
+            return "flat"
+
+    if spec.entry_long and evaluate_rules(spec.entry_long, features):
+        return "long"
+    if spec.entry_short and evaluate_rules(spec.entry_short, features):
+        return "short"
+    return "flat"
+

@@ -60,3 +60,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# AutoResearch vault (generated files)
+data/vault/search.db
+data/vault/logs/run_logs/
+.obsidian/

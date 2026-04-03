@@ -404,6 +404,14 @@ def _init_sqlite(con: sqlite3.Connection) -> None:
             details_json TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS market_marks (
+            instrument_key TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            venue TEXT NOT NULL,
+            price REAL NOT NULL,
+            ts TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_paper_positions_spec_id ON paper_positions(spec_id);
         CREATE INDEX IF NOT EXISTS idx_paper_positions_closed ON paper_positions(closed_at);
         CREATE INDEX IF NOT EXISTS idx_paper_orders_spec ON paper_orders(spec_id);

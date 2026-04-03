@@ -1,1 +1,1 @@
-"""Research agent prompts and helpers."""
+"""AutoResearch vault agents."""

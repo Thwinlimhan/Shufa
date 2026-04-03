@@ -49,18 +49,31 @@ def build_feature_frame(instrument: Instrument, timeframe, lookback_days: int):
     return enriched, start, now
 
 
+def _run_async(coro):
+    """Run an async coroutine safely regardless of whether an event loop is already running."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result(timeout=60)
+    return asyncio.run(coro)
+
+
 def _merge_market_context(features, instrument: Instrument):
     try:
         if instrument.venue == Venue.BINANCE:
-            oi = asyncio.run(binance.fetch_open_interest_history(instrument))
-            taker = asyncio.run(binance.fetch_taker_buy_sell_volume(instrument))
-            liquidations = asyncio.run(binance.fetch_liquidation_history(instrument))
-            book = asyncio.run(binance.fetch_order_book_snapshot(instrument))
+            oi = _run_async(binance.fetch_open_interest_history(instrument))
+            taker = _run_async(binance.fetch_taker_buy_sell_volume(instrument))
+            liquidations = _run_async(binance.fetch_liquidation_history(instrument))
+            book = _run_async(binance.fetch_order_book_snapshot(instrument))
         else:
-            oi = asyncio.run(hyperliquid.fetch_open_interest_history(instrument))
-            taker = asyncio.run(hyperliquid.fetch_taker_buy_sell_volume(instrument))
-            liquidations = asyncio.run(hyperliquid.fetch_liquidation_history(instrument))
-            book = asyncio.run(hyperliquid.fetch_order_book_snapshot(instrument))
+            oi = _run_async(hyperliquid.fetch_open_interest_history(instrument))
+            taker = _run_async(hyperliquid.fetch_taker_buy_sell_volume(instrument))
+            liquidations = _run_async(hyperliquid.fetch_liquidation_history(instrument))
+            book = _run_async(hyperliquid.fetch_order_book_snapshot(instrument))
     except Exception:
         oi = None
         taker = None

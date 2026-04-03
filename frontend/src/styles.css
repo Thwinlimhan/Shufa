@@ -199,7 +199,8 @@ button:hover {
   border: 1px solid var(--border-soft);
   border-radius: 14px;
   padding: 0.85rem 1rem;
-  background: white;
+  background: var(--bg-top);
+  color: var(--panel-text);
   font: inherit;
 }
 
@@ -207,7 +208,8 @@ button:hover {
   border: 1px solid var(--border-soft);
   border-radius: 14px;
   padding: 0.85rem 1rem;
-  background: white;
+  background: var(--bg-top);
+  color: var(--panel-text);
   font: inherit;
 }
 

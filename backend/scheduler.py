@@ -28,6 +28,16 @@ from backend.research.service import research_digest
 from backend.worker.service import process_next_job
 from backend.paper.runner import run_bar
 
+# AutoResearch agent imports (lazy to avoid circular imports)
+_vault_agents_imported = False
+
+
+def _ensure_vault_imports():
+    global _vault_agents_imported
+    if _vault_agents_imported:
+        return
+    _vault_agents_imported = True
+
 log = structlog.get_logger()
 scheduler = AsyncIOScheduler()
 _stream_tasks: list[asyncio.Task] = []
@@ -111,6 +121,36 @@ async def run_research_digest() -> None:
     log.info("research digest", analysis=digest.get("analysis", {}))
 
 
+# ── AutoResearch Scheduled Jobs ──────────────────────────────────────
+
+async def vault_ingestion_check() -> None:
+    """Watch raw/ for un-ingested files and trigger ingestion agent."""
+    from backend.research.agents.ingestion import ingest_new_files
+    results = await ingest_new_files()
+    log.info("vault ingestion check", ingested=len(results))
+
+
+async def vault_compiler_daily() -> None:
+    """Daily concept compilation pass."""
+    from backend.research.agents.compiler import compile_wiki
+    count = await compile_wiki()
+    log.info("vault compiler", concepts_written=count)
+
+
+async def vault_linter_weekly() -> None:
+    """Weekly wiki health check."""
+    from backend.research.agents.linter import lint_wiki
+    summary = await lint_wiki()
+    log.info("vault linter", issues=summary.get("total_issues", 0))
+
+
+async def vault_scout_weekly() -> None:
+    """Weekly gap detection."""
+    from backend.research.agents.scout import scout_gaps
+    report = await scout_gaps()
+    log.info("vault scout", report=str(report))
+
+
 async def _stream_loop(venue: str, symbols: list[str]) -> None:
     async def callback(payload: dict) -> None:
         ingest_mark_price(payload["venue"], payload["symbol"], float(payload["price"]), payload.get("ts"))
@@ -149,6 +189,11 @@ def setup_scheduler() -> AsyncIOScheduler:
     scheduler.add_job(ingest_funding_updates, CronTrigger(minute=7), id="funding_hourly", replace_existing=True)
     scheduler.add_job(ingest_market_context_updates, CronTrigger(minute=9), id="market_context_hourly", replace_existing=True)
     scheduler.add_job(run_research_digest, CronTrigger(hour=9, minute=0), id="research_digest", replace_existing=True)
+    # AutoResearch vault jobs
+    scheduler.add_job(vault_ingestion_check, IntervalTrigger(minutes=5), id="vault_ingestion", replace_existing=True)
+    scheduler.add_job(vault_compiler_daily, CronTrigger(hour=3, minute=0), id="vault_compiler", replace_existing=True)
+    scheduler.add_job(vault_linter_weekly, CronTrigger(hour=4, minute=0, day_of_week="sun"), id="vault_linter", replace_existing=True)
+    scheduler.add_job(vault_scout_weekly, CronTrigger(hour=5, minute=0, day_of_week="sun"), id="vault_scout", replace_existing=True)
     scheduler.start()
     _ensure_stream_tasks()
     return scheduler
