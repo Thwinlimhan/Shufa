@@ -68,6 +68,8 @@ type JobMetrics = {
   claimed: number;
   completed: number;
   failed: number;
+  retry_scheduled: number;
+  dead_letters: number;
 };
 
 export function ExecutionPage() {
@@ -80,29 +82,46 @@ export function ExecutionPage() {
 
   const strategies = useQuery({
     queryKey: ["execution-strategies"],
-    queryFn: () => apiGet<StrategyRow[]>("/strategies")
+    queryFn: () => apiGet<StrategyRow[]>("/strategies"),
+    refetchInterval: 15_000,
+    refetchIntervalInBackground: true
   });
   const tickets = useQuery({
     queryKey: ["execution-tickets"],
-    queryFn: () => apiGet<TicketRow[]>("/execution/tickets")
+    queryFn: () => apiGet<TicketRow[]>("/execution/tickets"),
+    refetchInterval: 10_000,
+    refetchIntervalInBackground: true
   });
   const reconciliation = useQuery({
     queryKey: ["execution-reconciliation"],
-    queryFn: () => apiGet<ReconciliationRow[]>("/execution/reconciliation")
+    queryFn: () => apiGet<ReconciliationRow[]>("/execution/reconciliation"),
+    refetchInterval: 20_000,
+    refetchIntervalInBackground: true
   });
   const secrets = useQuery({
     queryKey: ["execution-secrets"],
-    queryFn: () => apiGet<SecretsResponse>("/execution/secrets")
+    queryFn: () => apiGet<SecretsResponse>("/execution/secrets"),
+    refetchInterval: 30_000,
+    refetchIntervalInBackground: true
   });
   const jobs = useQuery({
     queryKey: ["execution-jobs"],
-    queryFn: () => apiGet<JobRow[]>("/execution/jobs")
+    queryFn: () => apiGet<JobRow[]>("/execution/jobs"),
+    refetchInterval: 10_000,
+    refetchIntervalInBackground: true
+  });
+  const deadLetters = useQuery({
+    queryKey: ["execution-dead-letters"],
+    queryFn: () => apiGet<Array<{ dead_letter_id: string; job_type: string; last_error?: string; failed_at: string }>>("/execution/jobs/dead-letters"),
+    refetchInterval: 20_000,
+    refetchIntervalInBackground: true
   });
   const jobMetrics = useQuery({
     queryKey: ["execution-job-metrics"],
-    queryFn: () => apiGet<JobMetrics>("/execution/jobs/metrics")
+    queryFn: () => apiGet<JobMetrics>("/execution/jobs/metrics"),
+    refetchInterval: 10_000,
+    refetchIntervalInBackground: true
   });
-
   useEffect(() => {
     if (!selectedSpecId && strategies.data?.length) {
       setSelectedSpecId(strategies.data[0].spec_id);
@@ -191,6 +210,26 @@ export function ExecutionPage() {
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Job processing failed.");
     }
+  }
+
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if (event.altKey && event.key.toLowerCase() === "a" && pendingTickets[0]) {
+        void approve(pendingTickets[0].ticket_id);
+      }
+      if (event.altKey && event.key.toLowerCase() === "j") {
+        void processQueue();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [pendingTickets]);
+
+  if (strategies.isLoading || tickets.isLoading || reconciliation.isLoading || jobs.isLoading || jobMetrics.isLoading || deadLetters.isLoading) {
+    return <section className="panel skeleton-block">Loading execution control...</section>;
+  }
+  if (strategies.isError || tickets.isError || reconciliation.isError || jobs.isError || jobMetrics.isError || deadLetters.isError) {
+    return <section className="panel">Failed to load execution control data.</section>;
   }
 
   return (
@@ -282,6 +321,10 @@ export function ExecutionPage() {
           <div className="metric-label">Secrets Ready</div>
           <div className="metric-value">{secrets.data?.all_present ? "yes" : "no"}</div>
         </div>
+        <div className="metric-card warm">
+          <div className="metric-label">Dead Letters</div>
+          <div className="metric-value">{jobMetrics.data?.dead_letters ?? 0}</div>
+        </div>
       </div>
 
       <div className="panel">
@@ -367,6 +410,22 @@ export function ExecutionPage() {
                 <span>{ready ? "configured" : "missing"}</span>
               </div>
             ))}
+          </div>
+
+          <div className="section-title">Dead Letter Queue</div>
+          <div className="range-list">
+            {(deadLetters.data ?? []).slice(0, 6).map((item) => (
+              <div key={item.dead_letter_id}>
+                <strong>{item.job_type}</strong>
+                <span>{item.last_error || "unknown_error"}</span>
+              </div>
+            ))}
+            {(deadLetters.data ?? []).length === 0 ? (
+              <div>
+                <strong>No dead letters</strong>
+                <span>Queue is healthy.</span>
+              </div>
+            ) : null}
           </div>
         </div>
         <div className="panel inspector-side">

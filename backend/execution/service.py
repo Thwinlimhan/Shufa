@@ -10,6 +10,7 @@ from backend.core.config import settings
 from backend.core.types import Instrument, Venue, VenueMode
 from backend.data.storage import fetch_all, fetch_one, save_json_record
 from backend.execution.adapters import adapter_for_venue
+from backend.ops.alerts import notify_event
 from backend.ops.audit import record_audit_event
 from backend.secrets.vault import secret_or_env
 from backend.worker.jobs import enqueue_job
@@ -70,7 +71,7 @@ def hydrate_ticket(row: dict) -> dict:
 
 
 def list_execution_tickets(limit: int = 100) -> list[dict]:
-    rows = fetch_all(f"SELECT * FROM execution_tickets ORDER BY created_at DESC LIMIT {int(limit)}")
+    rows = fetch_all("SELECT * FROM execution_tickets ORDER BY created_at DESC LIMIT ?", [int(limit)])
     return [hydrate_ticket(dict(row)) for row in rows]
 
 
@@ -108,6 +109,12 @@ def approve_execution_ticket(ticket_id: str, approved_by: str = "operator") -> d
 
     ticket["approved_at"] = datetime.now(timezone.utc).isoformat()
     save_json_record("execution_tickets", ticket, "ticket_id")
+    if ticket["status"] == "blocked":
+        notify_event(
+            "execution_blocked",
+            f"Execution blocked for {ticket['symbol']} {ticket['venue']}",
+            {"ticket_id": ticket_id, "preview": preview},
+        )
     record_audit_event(
         event_type="execution.ticket_approved",
         entity_type="execution_ticket",
@@ -192,7 +199,7 @@ def process_execution_job(payload: dict) -> dict:
 
 
 def list_reconciliation(limit: int = 50) -> list[dict]:
-    rows = fetch_all(f"SELECT * FROM execution_reconciliation ORDER BY created_at DESC LIMIT {int(limit)}")
+    rows = fetch_all("SELECT * FROM execution_reconciliation ORDER BY created_at DESC LIMIT ?", [int(limit)])
     return [
         {
             "reconciliation_id": row["reconciliation_id"],

@@ -10,6 +10,7 @@ def _set_temp_paths(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(storage, "RAW_ROOT", tmp_path / "raw")
     monkeypatch.setattr(storage, "CURATED_DB", tmp_path / "curated" / "workbench.duckdb")
     monkeypatch.setattr(storage, "META_DB", tmp_path / "meta" / "workbench.db")
+    storage.reset_sqlite_connection()
 
 
 def test_readiness_reports_live_blockers_when_live_is_disabled(monkeypatch, tmp_path) -> None:
@@ -45,4 +46,3 @@ def test_readiness_reports_live_blockers_when_live_is_disabled(monkeypatch, tmp_
     assert snapshot["summary"]["live_ready"] is False
     assert "live_trading_disabled_by_config" in snapshot["summary"]["blockers"]
     assert snapshot["counts"]["audit_events"] >= 1
-

@@ -4,7 +4,7 @@ import json
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from backend.backtest.service import compare_runs, execute_backtest, sweep_runs
+from backend.backtest.service import compare_runs, correlation_for_spec, execute_backtest, monte_carlo_for_run, sweep_runs, walk_forward
 from backend.auth.service import require_role
 from backend.data.storage import fetch_all, fetch_one, save_json_record
 from backend.ops.audit import record_audit_event
@@ -15,7 +15,7 @@ router = APIRouter()
 
 @router.get("")
 def list_backtests() -> list[dict]:
-    rows = fetch_all("SELECT * FROM backtest_runs ORDER BY ran_at DESC")
+    rows = fetch_all("SELECT * FROM backtest_runs ORDER BY ran_at DESC", [])
     return [
         {
             "run_id": row["run_id"],
@@ -105,6 +105,34 @@ def sweep_backtests(payload: dict, user: dict = Depends(require_role("operator")
             symbol=payload.get("symbol"),
             venue=payload.get("venue"),
             lookback_days=lookback_days,
+        )
+    }
+
+
+@router.post("/walk-forward")
+def walk_forward_backtest(payload: dict, user: dict = Depends(require_role("operator"))) -> dict:
+    return {
+        "analysis": walk_forward(
+            spec_id=payload["spec_id"],
+            symbol=payload.get("symbol"),
+            venue=payload.get("venue"),
+            lookback_days=payload.get("lookback_days", 180),
+            windows=payload.get("windows", 4),
+        )
+    }
+
+
+@router.get("/{run_id}/monte-carlo")
+def monte_carlo(run_id: str, simulations: int = 500) -> dict:
+    return {"run_id": run_id, "analysis": monte_carlo_for_run(run_id, simulations=simulations)}
+
+
+@router.post("/correlation")
+def correlation(payload: dict, user: dict = Depends(require_role("operator"))) -> dict:
+    return {
+        "analysis": correlation_for_spec(
+            spec_id=payload["spec_id"],
+            lookback_days=payload.get("lookback_days", 120),
         )
     }
 

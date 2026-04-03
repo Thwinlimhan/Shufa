@@ -1,0 +1,1 @@
+"""Market price stream adapters."""

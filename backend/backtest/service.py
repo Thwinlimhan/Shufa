@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
+import pandas as pd
+import structlog
 
+from backend.backtest.advanced import monte_carlo_trade_paths, strategy_correlation, walk_forward_analysis
 from backend.backtest.engine import run_backtest
 from backend.backtest.metrics import evaluate_promotion
 from backend.backtest.tuning import strategy_sweep_variants
 from backend.core.types import BacktestConfig, Instrument, Venue, dataclass_to_dict
 from backend.data.features import add_funding_features, compute_features
-from backend.data.service import load_funding_like_series
+from backend.data.service import attach_benchmark_close, load_funding_like_series
 from backend.data.storage import read_bars
 from backend.strategy.registry import load_spec
+from backend.data.adapters import binance, hyperliquid
+
+log = structlog.get_logger()
 
 
 def resolve_instrument(spec_id: str, symbol: str | None, venue: str | None) -> tuple:
@@ -34,10 +41,44 @@ def build_feature_frame(instrument: Instrument, timeframe, lookback_days: int):
     bars = read_bars(instrument, timeframe, start, now)
     if bars.empty:
         raise HTTPException(status_code=400, detail="No bars available for backtest")
+    bars = attach_benchmark_close(instrument, timeframe, bars)
     features = compute_features(bars)
+    features = _merge_market_context(features, instrument)
     funding = load_funding_like_series(instrument, timeframe, start, now)
     enriched = add_funding_features(features, funding)
     return enriched, start, now
+
+
+def _merge_market_context(features, instrument: Instrument):
+    try:
+        if instrument.venue == Venue.BINANCE:
+            oi = asyncio.run(binance.fetch_open_interest_history(instrument))
+            taker = asyncio.run(binance.fetch_taker_buy_sell_volume(instrument))
+            liquidations = asyncio.run(binance.fetch_liquidation_history(instrument))
+            book = asyncio.run(binance.fetch_order_book_snapshot(instrument))
+        else:
+            oi = asyncio.run(hyperliquid.fetch_open_interest_history(instrument))
+            taker = asyncio.run(hyperliquid.fetch_taker_buy_sell_volume(instrument))
+            liquidations = asyncio.run(hyperliquid.fetch_liquidation_history(instrument))
+            book = asyncio.run(hyperliquid.fetch_order_book_snapshot(instrument))
+    except Exception:
+        oi = None
+        taker = None
+        liquidations = None
+        book = {"spread_bps": 0.0, "orderbook_imbalance": 0.0}
+    merged = features.copy().sort_values("ts_open").reset_index(drop=True)
+    if oi is not None and not oi.empty:
+        merged = pd.merge_asof(merged, oi.sort_values("ts"), left_on="ts_open", right_on="ts", direction="backward")
+        merged.drop(columns=[col for col in ["ts"] if col in merged.columns], inplace=True)
+    if taker is not None and not taker.empty:
+        merged = pd.merge_asof(merged, taker.sort_values("ts"), left_on="ts_open", right_on="ts", direction="backward")
+        merged.drop(columns=[col for col in ["ts"] if col in merged.columns], inplace=True)
+    if liquidations is not None and not liquidations.empty:
+        merged = pd.merge_asof(merged, liquidations.sort_values("ts"), left_on="ts_open", right_on="ts", direction="backward")
+        merged.drop(columns=[col for col in ["ts"] if col in merged.columns], inplace=True)
+    merged["spread_bps"] = float(book.get("spread_bps") or 0.0)
+    merged["orderbook_imbalance"] = float(book.get("orderbook_imbalance") or 0.0)
+    return merged
 
 
 def execute_backtest(spec_id: str, symbol: str | None, venue: str | None, lookback_days: int) -> tuple[dict, dict]:
@@ -72,7 +113,8 @@ def compare_runs(spec_id: str, lookback_days: int) -> list[dict]:
                     "passed": decision["passed"],
                 }
             )
-        except HTTPException:
+        except Exception as exc:
+            log.warning("backtest compare failed", symbol=instrument.symbol, venue=instrument.venue.value, error=str(exc))
             comparisons.append(
                 {
                     "symbol": instrument.symbol,
@@ -103,3 +145,27 @@ def sweep_runs(spec_id: str, symbol: str | None, venue: str | None, lookback_day
             }
         )
     return sorted(results, key=lambda item: (item["sharpe"], item["return_pct"]), reverse=True)
+
+
+def walk_forward(spec_id: str, symbol: str | None, venue: str | None, lookback_days: int, windows: int = 4) -> dict:
+    spec, instrument = resolve_instrument(spec_id, symbol, venue)
+    return walk_forward_analysis(spec, instrument, lookback_days=lookback_days, windows=windows)
+
+
+def monte_carlo_for_run(run_id: str, simulations: int = 500) -> dict:
+    from backend.data.storage import fetch_one
+
+    row = fetch_one("SELECT result_json FROM backtest_runs WHERE run_id=?", [run_id])
+    if row is None:
+        raise HTTPException(status_code=404, detail="Backtest not found")
+    import json
+
+    result = json.loads(row["result_json"])
+    return monte_carlo_trade_paths(result.get("trades", []), simulations=simulations)
+
+
+def correlation_for_spec(spec_id: str, lookback_days: int = 120) -> dict:
+    spec = load_spec(spec_id)
+    if spec is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    return strategy_correlation(spec, lookback_days=lookback_days)

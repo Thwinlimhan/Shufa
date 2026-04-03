@@ -180,6 +180,12 @@ class TradeRecord:
 
 
 @dataclass
+class EquityPoint:
+    ts: datetime
+    equity: float
+
+
+@dataclass
 class BacktestResult:
     run_id: str
     spec_id: str
@@ -202,7 +208,7 @@ class BacktestResult:
     oos_sharpe: float
     diagnostics: dict[str, Any] = field(default_factory=dict)
     trades: list[TradeRecord] = field(default_factory=list)
-    equity_curve: list[tuple[datetime, float]] = field(default_factory=list)
+    equity_curve: list[EquityPoint] = field(default_factory=list)
 
 
 @dataclass
@@ -216,6 +222,7 @@ class PaperPosition:
     size_usd: float
     unrealized_pnl_usd: float = 0.0
     accrued_funding_usd: float = 0.0
+    entry_fees_usd: float = 0.0
 
 
 @dataclass

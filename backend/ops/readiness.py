@@ -7,6 +7,7 @@ from backend.data.storage import fetch_all
 from backend.execution.service import live_secrets_status
 from backend.paper.activity import portfolio_snapshot
 from backend.strategy.targets import best_target_snapshot
+from backend.worker.service import worker_health
 
 FRESHNESS_WINDOWS = {
     "15m": timedelta(minutes=30),
@@ -21,15 +22,17 @@ def _parse_ts(value: str | None) -> datetime | None:
 
 def readiness_snapshot() -> dict:
     now = datetime.now(timezone.utc)
-    health_rows = [dict(row) for row in fetch_all("SELECT * FROM dataset_health ORDER BY instrument_key, timeframe")]
-    audit_count = fetch_all("SELECT COUNT(*) AS count FROM audit_events")[0]["count"] if health_rows is not None else 0
-    paper_event_count = fetch_all("SELECT COUNT(*) AS count FROM paper_cycle_events")[0]["count"]
-    reconciliation_count = fetch_all("SELECT COUNT(*) AS count FROM execution_reconciliation")[0]["count"]
+    health_rows = [dict(row) for row in fetch_all("SELECT * FROM dataset_health ORDER BY instrument_key, timeframe", [])]
+    audit_count = fetch_all("SELECT COUNT(*) AS count FROM audit_events", [])[0]["count"] if health_rows is not None else 0
+    paper_event_count = fetch_all("SELECT COUNT(*) AS count FROM paper_cycle_events", [])[0]["count"]
+    reconciliation_count = fetch_all("SELECT COUNT(*) AS count FROM execution_reconciliation", [])[0]["count"]
     promoted_targets = fetch_all(
-        "SELECT COUNT(*) AS count FROM strategy_targets WHERE status='promoted'"
+        "SELECT COUNT(*) AS count FROM strategy_targets WHERE status='promoted'",
+        [],
     )[0]["count"]
     paper_targets = fetch_all(
-        "SELECT COUNT(*) AS count FROM strategy_targets WHERE paper_enabled=1 AND status IN ('candidate','promoted')"
+        "SELECT COUNT(*) AS count FROM strategy_targets WHERE paper_enabled=1 AND status IN ('candidate','promoted')",
+        [],
     )[0]["count"]
 
     health_issues: list[str] = []
@@ -54,6 +57,7 @@ def readiness_snapshot() -> dict:
     best_target = best_target_snapshot()
     portfolio = portfolio_snapshot(limit=20)
     secrets = live_secrets_status()
+    workers = worker_health()
 
     blockers: list[str] = []
     if not data_ready:
@@ -72,6 +76,8 @@ def readiness_snapshot() -> dict:
         blockers.append("live_exchange_secrets_missing")
     if reconciliation_count == 0:
         blockers.append("no_execution_reconciliation_history")
+    if not workers["healthy"]:
+        blockers.append("worker_unhealthy")
 
     live_ready = (
         settings.live_trading_enabled
@@ -101,14 +107,18 @@ def readiness_snapshot() -> dict:
             "promoted_targets": promoted_targets,
             "active_paper_targets": paper_targets,
             "open_positions": len(portfolio["positions"]),
+            "workers": len(workers["workers"]),
         },
         "risk": {
             "paper_trading_enabled": settings.paper_trading_enabled,
             "live_trading_enabled": settings.live_trading_enabled,
             "live_approval_mode": settings.live_approval_mode,
             "paper_max_open_positions": settings.paper_max_open_positions,
+            "paper_max_gross_exposure_usd": settings.paper_max_gross_exposure_usd,
+            "paper_max_signal_correlation": settings.paper_max_signal_correlation,
             "paper_daily_loss_limit_usd": settings.paper_daily_loss_limit_usd,
             "live_secrets": secrets,
+            "worker_health": workers["healthy"],
         },
         "best_target": best_target,
         "recent_health_issues": health_issues[:20],

@@ -99,7 +99,7 @@ def list_targets(spec_id: str | None = None) -> list[dict]:
     if spec_id:
         rows = fetch_all("SELECT * FROM strategy_targets WHERE spec_id=? ORDER BY updated_at DESC", [spec_id])
     else:
-        rows = fetch_all("SELECT * FROM strategy_targets ORDER BY updated_at DESC")
+        rows = fetch_all("SELECT * FROM strategy_targets ORDER BY updated_at DESC", [])
     return [dict(row) for row in rows]
 
 
@@ -112,7 +112,8 @@ def list_active_paper_targets() -> list[dict]:
         WHERE t.paper_enabled = 1
           AND t.status IN ('candidate', 'promoted')
         ORDER BY t.updated_at DESC
-        """
+        """,
+        [],
     )
     return [dict(row) for row in rows]
 
@@ -184,7 +185,8 @@ def best_target_snapshot() -> dict | None:
         JOIN strategy_specs s ON s.spec_id = t.spec_id
         LEFT JOIN backtest_runs b ON b.run_id = t.last_backtest_run_id
         WHERE t.last_backtest_run_id IS NOT NULL
-        """
+        """,
+        [],
     )
     snapshots: list[dict] = []
     for row in rows:

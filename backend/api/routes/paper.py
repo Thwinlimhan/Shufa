@@ -6,6 +6,7 @@ from backend.auth.service import require_role
 from backend.core.types import Timeframe
 from backend.data.service import default_instruments, latest_feature_bar_async, mark_processed, should_process_bar
 from backend.data.storage import get_sqlite
+from backend.ops.alerts import notify_event
 from backend.ops.audit import record_audit_event
 from backend.paper.activity import list_recent_orders, portfolio_snapshot
 from backend.paper.runner import run_bar
@@ -40,6 +41,7 @@ def kill_switch(user: dict = Depends(require_role("admin"))) -> dict:
         entity_id="global",
         payload={"closed_positions": updated},
     )
+    notify_event("kill_switch_fired", "Paper kill switch triggered", {"closed_positions": updated, "actor": user["display_name"]})
     return {"closed_positions": updated}
 
 

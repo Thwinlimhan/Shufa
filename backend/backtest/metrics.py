@@ -1,16 +1,23 @@
 from __future__ import annotations
 
-from backend.core.types import BacktestResult, PromotionDecision, PromotionPolicy, utc_now
+from backend.core.types import BacktestResult, EquityPoint, PromotionDecision, PromotionPolicy, utc_now
 
 
-def compute_max_drawdown(equity_curve: list[tuple]) -> tuple[float, float]:
+def compute_max_drawdown(equity_curve: list[tuple] | list[EquityPoint]) -> tuple[float, float]:
     if not equity_curve:
         return 0.0, 0.0
-    peak = equity_curve[0][1]
-    peak_time = equity_curve[0][0]
+    first = equity_curve[0]
+    if isinstance(first, EquityPoint):
+        peak = first.equity
+        peak_time = first.ts
+        iterator = ((point.ts, point.equity) for point in equity_curve)
+    else:
+        peak = first[1]
+        peak_time = first[0]
+        iterator = ((point[0], point[1]) for point in equity_curve)
     max_dd = 0.0
     max_duration = 0.0
-    for ts, value in equity_curve:
+    for ts, value in iterator:
         if value >= peak:
             peak = value
             peak_time = ts

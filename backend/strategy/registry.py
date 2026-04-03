@@ -36,23 +36,22 @@ def bootstrap_builtin_specs() -> None:
 
 
 def list_specs() -> list[dict]:
-    bootstrap_builtin_specs()
-    rows = fetch_all("SELECT spec_id, name, version, parent_id, status, created_at, spec_json FROM strategy_specs ORDER BY created_at DESC")
+    rows = fetch_all("SELECT spec_id, name, version, parent_id, status, created_at, spec_json FROM strategy_specs ORDER BY created_at DESC", [])
     results = []
     for row in rows:
         target_summary = strategy_status_summary(row["spec_id"])
         results.append(
             {
-            "spec_id": row["spec_id"],
-            "name": row["name"],
-            "version": row["version"],
-            "parent_id": row["parent_id"],
-            "status": target_summary["status"],
-            "created_at": row["created_at"],
-            "spec": json.loads(row["spec_json"]),
-            "paper_enabled_count": target_summary["paper_enabled_count"],
-            "targets": target_summary["targets"],
-        }
+                "spec_id": row["spec_id"],
+                "name": row["name"],
+                "version": row["version"],
+                "parent_id": row["parent_id"],
+                "status": target_summary["status"],
+                "created_at": row["created_at"],
+                "spec": json.loads(row["spec_json"]),
+                "paper_enabled_count": target_summary["paper_enabled_count"],
+                "targets": target_summary["targets"],
+            }
         )
     return results
 

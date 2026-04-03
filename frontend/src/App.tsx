@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { apiPost, setAuthToken } from "./api/client";
+import { apiPost } from "./api/client";
 import { DataHealthPage } from "./pages/DataHealthPage";
 import { ExecutionPage } from "./pages/ExecutionPage";
 import { PaperPortfolioPage } from "./pages/PaperPortfolioPage";
@@ -20,17 +20,39 @@ export function App() {
   const [tab, setTab] = useState<TabKey>("health");
   const [role, setRole] = useState<string>("operator");
   const [identity, setIdentity] = useState<string>("Operator");
+  const [theme, setTheme] = useState<"dark" | "light">(() => {
+    if (typeof window === "undefined") return "dark";
+    return (window.localStorage.getItem("workbench_theme") as "dark" | "light") || "dark";
+  });
 
   useEffect(() => {
-    apiPost<{ role: string; token: string; display_name: string }>("/auth/login", { role })
+    apiPost<{ role: string; display_name: string }>("/auth/login", { role })
       .then((user) => {
-        setAuthToken(user.token);
         setIdentity(user.display_name);
       })
       .catch(() => {
         setIdentity("Unknown");
       });
   }, [role]);
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    window.localStorage.setItem("workbench_theme", theme);
+  }, [theme]);
+
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if (event.ctrlKey) {
+        if (event.key === "1") setTab("health");
+        if (event.key === "2") setTab("strategies");
+        if (event.key === "3") setTab("paper");
+        if (event.key === "4") setTab("execution");
+        if (event.key === "5") setTab("settings");
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
 
   return (
     <div className="app-shell">
@@ -47,6 +69,9 @@ export function App() {
             <option value="operator">operator</option>
             <option value="admin">admin</option>
           </select>
+          <button className="secondary-button" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
+            Theme: {theme}
+          </button>
         </div>
         <nav className="nav">
           {tabs.map((item) => (
@@ -59,6 +84,9 @@ export function App() {
             </button>
           ))}
         </nav>
+        <div className="muted" style={{ marginTop: "1rem", fontSize: "0.82rem" }}>
+          Shortcuts: `Ctrl+1..5` tabs, `Alt+B` backtest, `Alt+R` paper cycle, `Alt+A` approve.
+        </div>
       </aside>
       <main className="content">
         <div className="workspace">

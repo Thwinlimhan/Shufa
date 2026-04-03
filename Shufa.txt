@@ -1,0 +1,852 @@
+# CryptoSwarms — Deep Technical & Product Review
+
+> Owner · Crypto Expert · Senior Software Engineer perspective  
+> Reviewed: April 2026 | Codebase version 0.1.0
+
+-----
+
+## Executive Summary
+
+CryptoSwarms is a thoughtfully scaffolded local-first crypto research workbench with a solid conceptual spine: ingest → feature engineering → backtest → paper trade → gated live execution. The architecture is intentional and conservative — paper trading must pass promotion gates before live orders are even possible. That is the right default.
+
+However, in its current state the system is **not yet trustworthy enough to run live money**, and **not yet powerful enough to outperform even a naive systematic trader**. This document catalogs every critical defect, meaningful weakness, and feature gap found in the review, then provides a concrete improvement roadmap.
+
+Severity legend used throughout:  
+🔴 **Critical** — data loss, money loss, or security breach risk  
+🟠 **High** — incorrect results, silent failures, or broken core features  
+🟡 **Medium** — degraded experience, missing guard-rails, or reliability risk  
+🟢 **Low / Enhancement** — quality-of-life, competitive edge, or operational maturity
+
+-----
+
+## Part 1 — Security Audit 🔴🔴🔴
+
+### 1.1 Production Secret Committed to Repository 🔴
+
+**File:** `.env`
+
+```
+VAULT_PASSPHRASE=Wl6o2wcrMBPhbGJ82Z-JBJOTTd7RUHlx
+```
+
+The vault passphrase — the single key protecting all exchange credentials — is committed in plaintext to the repo. **Any git history exposure, misconfigured git remote, or accidental push to a public fork will leak this key and compromise all secrets stored in the vault.**
+
+**Fix:**
+
+- Rotate the passphrase immediately
+- Add `.env` to `.gitignore` (it already is, but clearly someone edited `.env` directly instead of using `.env.example`)
+- Add a pre-commit hook that scans for high-entropy strings
+- Use `git-secrets` or `truffleHog` in CI to prevent future commits
+
+### 1.2 Trivially Guessable Default Auth Tokens 🔴
+
+**File:** `.env`, `backend/auth/service.py`
+
+```
+AUTH_VIEWER_TOKEN=viewer-token
+AUTH_OPERATOR_TOKEN=operator-token
+AUTH_ADMIN_TOKEN=admin-token
+```
+
+These are the hardcoded defaults in both `.env.example` and the actual `.env`. Anyone who knows the API base URL can immediately authenticate as admin. The `bootstrap_secure_runtime.py` script generates a strong vault passphrase but **does not generate random auth tokens**.
+
+**Fix:**
+
+```python
+# In bootstrap_secure_runtime.py, replace:
+"AUTH_VIEWER_TOKEN": "viewer-token",
+# With:
+"AUTH_VIEWER_TOKEN": secrets.token_urlsafe(32),
+"AUTH_OPERATOR_TOKEN": secrets.token_urlsafe(32),
+"AUTH_ADMIN_TOKEN": secrets.token_urlsafe(32),
+```
+
+### 1.3 No Rate Limiting on Any API Endpoint 🔴
+
+A brute-force attack against `/auth/token` can enumerate tokens in seconds. The execution endpoints — including `/execution/tickets/{id}/approve` — have no rate limiting, making it trivial to replay or spam approval requests.
+
+**Fix:** Add `slowapi` (built on `limits`) middleware:
+
+```python
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+# Then on sensitive endpoints:
+@router.post("/token")
+@limiter.limit("10/minute")
+def token_session(...): ...
+```
+
+### 1.4 CORS Allows All Methods and Headers from Any localhost Origin 🟠
+
+**File:** `backend/api/app.py`
+
+```python
+allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+allow_methods=["*"],
+allow_headers=["*"],
+```
+
+This is fine for local development but the `allow_methods=["*"]` and `allow_headers=["*"]` combination is overly permissive. In a Docker/cloud deployment the origins list must become configurable via environment variable rather than hardcoded.
+
+### 1.5 Auth Token Stored in localStorage — XSS Exploitable 🟠
+
+**File:** `frontend/src/api/client.ts`
+
+```typescript
+window.localStorage.setItem(TOKEN_KEY, token);
+```
+
+`localStorage` is accessible to any JavaScript on the page. A single XSS vector anywhere in the frontend (e.g., a strategy name with injected script content rendered without escaping) will steal the admin token.
+
+**Fix:** Use `httpOnly` cookies set by the server, or at minimum move to `sessionStorage` with a short expiry. For a local tool, this is acceptable risk, but must be documented.
+
+### 1.6 SQL Injection Risk in Dynamic LIMIT Clauses 🟡
+
+**File:** `backend/data/storage.py` (pattern used across routes)
+
+```python
+fetch_all(f"SELECT * FROM audit_events ORDER BY created_at DESC LIMIT {int(limit)}")
+```
+
+The `int(limit)` cast mitigates injection but the pattern should use parameterized queries consistently:
+
+```python
+fetch_all("SELECT * FROM audit_events ORDER BY created_at DESC LIMIT ?", [limit])
+```
+
+### 1.7 Execution Adapter HMAC Bug Under Python Strict Mode 🟠
+
+**File:** `backend/execution/adapters.py`
+
+```python
+signature = hmac.new(self.api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+```
+
+`hmac.new` is a legacy alias that works in CPython but is not part of the public API contract. The correct call is:
+
+```python
+signature = hmac.HMAC(
+    self.api_secret.encode("utf-8"),
+    query.encode("utf-8"),
+    hashlib.sha256
+).hexdigest()
+```
+
+This will silently fail on some Python distributions and pypy.
+
+-----
+
+## Part 2 — Correctness Bugs (Silent Wrong Results) 🔴🟠
+
+### 2.1 Perturbation Sharpe Is Not Actually Computed 🔴
+
+**File:** `backend/backtest/engine.py`
+
+```python
+perturbation_sharpe_mean=sharpe,   # ← same as base sharpe
+perturbation_sharpe_std=0.0,       # ← always zero
+oos_sharpe=sharpe * 0.9,           # ← 90% of in-sample, not walk-forward
+```
+
+The promotion policy checks `min_perturbation_sharpe` and `min_oos_sharpe` — two of the five gates that determine whether a strategy gets promoted. Both checks pass on synthetic numbers that are mathematically derived from the in-sample Sharpe, guaranteeing that **every backtest with a positive Sharpe will pass these gates regardless of robustness**. This is the most dangerous correctness bug in the system.
+
+**Fix — Real Perturbation (noise injection):**
+
+```python
+import numpy as np
+
+def compute_perturbation_sharpe(spec, bars, config, n_runs=20):
+    sharpes = []
+    for _ in range(n_runs):
+        noised = bars.copy()
+        noised["close"] *= np.random.uniform(0.998, 1.002, size=len(noised))
+        result = run_backtest(spec, noised, config)
+        sharpes.append(result.sharpe)
+    return float(np.mean(sharpes)), float(np.std(sharpes))
+```
+
+**Fix — Real OOS Sharpe (walk-forward split):**
+
+```python
+def compute_oos_sharpe(spec, bars, config, oos_fraction=0.3):
+    split = int(len(bars) * (1 - oos_fraction))
+    oos_bars = bars.iloc[split:].reset_index(drop=True)
+    oos_start = oos_bars["ts_open"].iloc[0].to_pydatetime()
+    oos_config = replace(config, start_date=oos_start)
+    oos_result = run_backtest(spec, oos_bars, oos_config)
+    return oos_result.sharpe
+```
+
+### 2.2 Funding Reversion Strategy Will Never Fire in Production 🔴
+
+**File:** `backend/data/service.py` (implied), `backend/backtest/service.py`
+
+```python
+def load_funding_like_series(...):
+    # Returns empty DataFrame with columns ["ts", "rate"]
+```
+
+The `builtin-funding-mean-reversion` strategy requires `funding_zscore` — a feature that requires a populated funding rate history. `load_funding_like_series` always returns an empty frame (the actual Binance/Hyperliquid funding ingestion is not implemented). As a result:
+
+- `funding_rate` is always `0.0` after `add_funding_features`
+- `funding_zscore` is always `0.0` (or NaN)
+- `entry_long` rule `funding_zscore < -2.0` **never triggers**
+- `entry_short` rule `funding_zscore > 2.0` **never triggers**
+- Total trades in backtests: **0**
+
+This strategy silently appears to work (the backtest runs without error) but produces meaningless results.
+
+**Fix — Implement Binance Funding Rate Ingestion:**
+
+```python
+async def fetch_binance_funding_history(symbol: str, start_ms: int, end_ms: int) -> list[dict]:
+    url = f"{settings.binance_base_url}/fapi/v1/fundingRate"
+    params = {"symbol": symbol, "startTime": start_ms, "endTime": end_ms, "limit": 1000}
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, params=params, timeout=15.0)
+        resp.raise_for_status()
+        return resp.json()
+```
+
+### 2.3 `trend_signal` Feature Is Referenced But Never Computed 🔴
+
+**File:** `backend/strategy/signals/momentum.py`, `backend/data/features.py` (missing)
+
+The momentum strategy entry rules require `trend_signal`:
+
+```python
+RuleBlock(feature="trend_signal", operator="gt", threshold=0),
+```
+
+But `trend_signal` is not in the feature computation pipeline. The `evaluate_rule` function silently returns `False` for unknown features:
+
+```python
+def evaluate_rule(rule, features):
+    if rule.feature not in features:
+        return False  # ← silent failure, looks like "no signal"
+```
+
+The momentum strategy will only generate signals on the `ret_4` and `vol_ratio` conditions being met, then fail on `trend_signal`, meaning **the third condition always blocks entry**. Momentum strategy produces zero trades for the same reason.
+
+**Fix:**
+
+```python
+# In features.py compute_features():
+def compute_trend_signal(close: pd.Series, fast: int = 20, slow: int = 50) -> pd.Series:
+    ema_fast = close.ewm(span=fast).mean()
+    ema_slow = close.ewm(span=slow).mean()
+    return np.sign(ema_fast - ema_slow)  # +1 uptrend, -1 downtrend
+```
+
+### 2.4 Backtest Engine Misses Position After Last Bar 🟠
+
+**File:** `backend/backtest/engine.py`
+
+```python
+for row in frame.to_dict(orient="records"):
+    ...
+# After loop: open position is silently abandoned, not closed
+```
+
+If the final signal is `long` or `short` at the end of the backtest window, the open position is never closed and never added to `trades`. This understates trade count and can materially distort win-rate and profit-factor calculations for strategies with long hold periods.
+
+**Fix:**
+
+```python
+# After the main loop, force-close any open position:
+if current_side in {"long", "short"} and frame is not empty:
+    last_price = float(frame.iloc[-1]["close"])
+    last_ts = pd.Timestamp(frame.iloc[-1]["ts_open"]).to_pydatetime()
+    # ... close position with last_price
+```
+
+### 2.5 Daily Loss Limit Uses UTC Midnight — Wrong for Crypto Markets 🟡
+
+**File:** `backend/paper/runner.py`
+
+```python
+start_of_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, ...).isoformat()
+```
+
+Crypto never closes; there is no canonical “day” reset. Using UTC midnight means the loss limit resets at different local times across time zones and does not align with funding windows (which reset at 00:00, 08:00, 16:00 UTC). This should be configurable with a `PAPER_DAY_RESET_HOUR_UTC` env var.
+
+### 2.6 Unrealized PnL Does Not Account for Fees 🟡
+
+**File:** `backend/paper/runner.py`
+
+```python
+unrealized = raw_pnl + float(position["accrued_funding_usd"])
+```
+
+Open position unrealized PnL does not deduct the opening fee. A position that is flat (price unchanged) shows `$0` PnL when it should show `-fee`. This makes paper trading appear slightly more profitable than reality.
+
+-----
+
+## Part 3 — Architecture & Reliability 🟠🟡
+
+### 3.1 In-Process APScheduler Is Fragile in Multi-Worker Deployment
+
+**File:** `backend/scheduler.py`, `docker-compose.yml`
+
+The Docker Compose file runs both an `api` container and a `worker` container. The `api` container runs the scheduler on startup if `SCHEDULER_ENABLED=true`. But `docker-compose.yml` passes `SCHEDULER_ENABLED=true` only to the worker. However `backend/api/app.py` also calls `setup_scheduler()` if the flag is set — meaning in a misconfigured deployment, two scheduler instances can run simultaneously, causing duplicate bar processing and double-entry of paper trades.
+
+**Fix:** The scheduler should run exclusively in the worker process. The API should never run the scheduler. Remove the `setup_scheduler()` call from `backend/api/app.py` startup.
+
+### 3.2 SQLite Has No Connection Pooling or WAL Mode
+
+**File:** `backend/data/storage.py`
+
+Under concurrent requests (multiple browser tabs, automated tests, scheduler ticks), SQLite will produce `database is locked` errors. The meta database should use WAL mode:
+
+```python
+def get_sqlite():
+    con = sqlite3.connect(str(META_DB), check_same_thread=False)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.row_factory = sqlite3.Row
+    return con
+```
+
+Additionally, `get_sqlite()` creates a new connection on every call. A module-level connection pool (even a simple `threading.local()` cache) is needed.
+
+### 3.3 No Retry Logic for External HTTP Calls
+
+**File:** `backend/execution/adapters.py`, `backend/data/adapters/`
+
+All HTTP calls use `httpx` with a single attempt. A transient network error during bar ingestion, live order submission, or funding rate fetch will propagate as an unhandled exception. For execution-critical paths, this is unacceptable.
+
+**Fix:**
+
+```python
+import tenacity
+
+@tenacity.retry(
+    wait=tenacity.wait_exponential(multiplier=1, min=1, max=10),
+    stop=tenacity.stop_after_attempt(3),
+    reraise=True,
+)
+async def _fetch_with_retry(url, params):
+    ...
+```
+
+### 3.4 `save_json_record` Is Not Atomic (TOCTOU Race) 🟡
+
+**File:** `backend/data/storage.py`
+
+The pattern `fetch_one(...) → INSERT or UPDATE` is a classic check-then-act race condition. Under concurrent scheduler ticks (which is likely), two bar-close handlers can both read “no record exists” and then both attempt an INSERT, causing a unique constraint violation or duplicate data.
+
+**Fix:** Use `INSERT OR REPLACE INTO` (SQLite upsert) as a single atomic statement.
+
+### 3.5 Worker Queue Has No Dead-Letter Queue or Retry Policy
+
+**File:** `backend/worker/service.py`
+
+A failed `execution_submit` job is marked `failed` and never retried. In live execution, a transient network error causes the order to be permanently abandoned with no alert. There is also no maximum retry count, no exponential backoff, and no alerting hook.
+
+### 3.6 No Health Check for the Worker Process
+
+The `docker-compose.yml` has a health check endpoint (`/health`) on the API but nothing monitoring the worker loop. If the worker crashes, jobs queue silently forever with no operator notification.
+
+-----
+
+## Part 4 — Missing Crypto-Critical Features
+
+### 4.1 No Real-Time Price Feed (WebSocket) 🔴
+
+The entire paper trading loop depends on `latest_feature_bar_async` which reads from stored bars. There is no live price feed. This means:
+
+- Paper P&L is stale between bar closes (up to 15 minutes)
+- No intrabar stop-loss execution
+- No live mark-to-market
+- No liquidation risk monitoring
+
+**Required addition:** Binance USDS-M Futures WebSocket stream for mark price and book ticker, plus a Hyperliquid WebSocket for the same.
+
+```python
+# backend/data/streams/binance_ws.py
+import websockets, json
+
+async def stream_mark_prices(symbols: list[str], callback):
+    streams = "/".join(f"{s.lower()}usdt@markPrice" for s in symbols)
+    url = f"wss://fstream.binance.com/stream?streams={streams}"
+    async with websockets.connect(url) as ws:
+        async for msg in ws:
+            data = json.loads(msg)
+            await callback(data["data"])
+```
+
+### 4.2 Funding Rate Ingestion Is Entirely Missing
+
+Binance perpetuals pay funding every 8 hours. Hyperliquid pays every hour. These rates directly affect PnL for any position held through a funding window. The backtest engine has `funding_included=True` in `BacktestConfig` but the funding values are never actually loaded.
+
+**Required additions:**
+
+1. `backend/data/adapters/binance_funding.py` — fetch `/fapi/v1/fundingRate` history
+1. `backend/data/adapters/hyperliquid_funding.py` — fetch Hyperliquid funding history
+1. Scheduler job to ingest funding every 8h for Binance, 1h for Hyperliquid
+1. Storage schema for funding rate time-series in DuckDB
+
+### 4.3 No Open Interest or Liquidation Data
+
+Open Interest (OI) and liquidation cascade data are among the highest-signal features for crypto perpetuals:
+
+- OI divergence from price = exhaustion signal
+- Liquidation clusters = support/resistance levels
+- Large liquidation events = volatility regime change trigger
+
+Neither is ingested, stored, or used as a feature.
+
+### 4.4 No Order Book Data (Market Microstructure Blind)
+
+Bid-ask spread, order book imbalance, and large order detection are critical for:
+
+- Realistic slippage modeling (current slippage is a flat BPS constant — wrong)
+- Entry timing within bars
+- Detecting manipulation ahead of large moves
+
+### 4.5 Only Three Hard-Coded Strategies — No User-Defined Strategy DSL
+
+The strategy engine is excellent (rule-based, declarative, serializable) but the three built-in strategies cover only a small portion of the strategy space. Users cannot define new strategies without writing Python. A web-based strategy builder should expose:
+
+- Feature selector dropdowns
+- Operator selector (gt, lt, between, crossover)
+- Threshold inputs with live preview
+- Hypothesis text field
+- Save to registry button
+
+### 4.6 No Walk-Forward Optimization Framework
+
+Walk-forward optimization (WFO) is the industry standard for avoiding overfitting in systematic trading. The current sweep only runs in-sample across parameter grids. A proper WFO would:
+
+1. Split data into N windows (train + test)
+1. Optimize parameters on train
+1. Evaluate on test
+1. Concatenate test-period equity curves
+1. Report stability score = mean(test_sharpe) / std(test_sharpe)
+
+### 4.7 No Portfolio-Level Risk Management
+
+Each strategy runs independently with its own position limits. There is no:
+
+- Portfolio-level gross/net exposure cap
+- Correlation check between open positions
+- Portfolio VaR / CVaR calculation
+- Drawdown-based position sizing adjustment
+- Cross-strategy margin usage tracking
+
+### 4.8 No Alerts or Notifications System
+
+When a position is opened, closed, or a stop-loss fires, operators have no notification. This is the single most common operational failure in algo trading: the system is doing something unexpected and nobody knows.
+
+**Minimum viable alerts:**
+
+- Telegram bot webhook (easy to implement, widely used in crypto ops)
+- Discord webhook
+- Email via SMTP
+- Configurable trigger conditions: daily_pnl, position_opened, kill_switch_fired, execution_blocked
+
+### 4.9 No Stop-Loss or Take-Profit in Paper Trading
+
+**File:** `backend/paper/runner.py`
+
+The paper trading engine only closes positions on signal reversal. There are no:
+
+- Fixed-percentage stop losses
+- ATR-based trailing stops
+- Time-based exits (max hold period)
+- Take-profit targets
+
+The `RiskLimits` dataclass has `stop_loss_atr_mult` and `take_profit_atr_mult` fields — these are defined but never evaluated anywhere. This is a dead code trap.
+
+**Fix:** Add stop/TP evaluation in `run_bar()`:
+
+```python
+def _check_stop_take(position, current_price, spec) -> str | None:
+    entry = float(position["entry_price"])
+    pnl_pct = (current_price - entry) / entry
+    if position["direction"] == "short":
+        pnl_pct = -pnl_pct
+    if spec.risk_limits.stop_loss_atr_mult:
+        atr = current_bar.get("atr_14", 0)
+        stop_dist = spec.risk_limits.stop_loss_atr_mult * atr / entry
+        if pnl_pct <= -stop_dist:
+            return "stop_loss"
+    if spec.risk_limits.take_profit_atr_mult:
+        atr = current_bar.get("atr_14", 0)
+        tp_dist = spec.risk_limits.take_profit_atr_mult * atr / entry
+        if pnl_pct >= tp_dist:
+            return "take_profit"
+    return None
+```
+
+### 4.10 Sizing Is Always Fixed Notional — Vol Targeting Not Implemented
+
+The `SizingSpec` supports `vol_target` and `kelly_half` methods but both fall through to the `fixed_notional_usd` default in the paper runner:
+
+```python
+size_usd = spec.sizing.fixed_notional_usd or 1_000.0
+```
+
+Volatility-targeted sizing is critical for risk-adjusted returns and should be the default for professional use.
+
+### 4.11 No Correlation Analysis Between Strategies
+
+Running long BTC momentum and long ETH momentum simultaneously in the same market regime is effectively doubling concentrated directional exposure. There is no:
+
+- Pairwise correlation of strategy returns
+- Regime-conditional correlation computation
+- Diversification benefit calculation
+- Warning when adding a correlated strategy to the active set
+
+### 4.12 No Monte Carlo / Synthetic Equity Curve Analysis
+
+Beyond perturbation testing, professional quant shops run:
+
+- Bootstrap resampling of trade PnL to compute equity curve confidence bands
+- Worst-case scenario analysis (what if the 10 worst trades came consecutively?)
+- Kelly criterion estimation from trade distribution
+- Probability of ruin calculation
+
+-----
+
+## Part 5 — Feature Engineering Gaps
+
+### 5.1 Missing ATR (Average True Range)
+
+ATR is referenced in `RiskLimits.stop_loss_atr_mult` and `take_profit_atr_mult` but is not computed in `compute_features()`. It is also in `KNOWN_FEATURES` in the validator but returns `False` when evaluated.
+
+### 5.2 Missing Features for Complete Coverage
+
+Current computed features vs what’s declared in `KNOWN_FEATURES`:
+
+|Feature         |Computed?|Notes              |
+|----------------|---------|-------------------|
+|`ret_1`         |✅        |1-bar return       |
+|`ret_4`         |✅        |4-bar return       |
+|`vol_20`        |✅        |Rolling vol        |
+|`vol_ratio`     |✅        |Recent/baseline vol|
+|`atr_14`        |❌        |**Missing**        |
+|`rsi_14`        |✅        |RSI                |
+|`pct_rank_20`   |✅        |Price rank         |
+|`trend_signal`  |❌        |**Missing**        |
+|`funding_rate`  |❌        |**No data source** |
+|`funding_zscore`|❌        |**No data source** |
+|`close`         |✅        |Pass-through       |
+|`volume_quote`  |✅        |Pass-through       |
+
+### 5.3 No Cross-Asset Features
+
+BTC dominance, BTC/ETH ratio, and correlation to SPX/Gold are among the strongest regime filters for altcoin strategies. None are implemented.
+
+### 5.4 On-Chain Features Not Considered
+
+Exchange net flow, whale wallet activity, and miner outflows are now available via APIs (Glassnode, CryptoQuant, Nansen). These are alpha sources unavailable to most retail traders and particularly valuable for mean-reversion strategies.
+
+-----
+
+## Part 6 — Frontend / UX Issues
+
+### 6.1 No Real-Time Updates — Everything Is Stale
+
+The frontend uses `useQuery` with default settings (no `refetchInterval`). Once loaded, data does not update. A paper trading dashboard that shows stale positions is operationally dangerous.
+
+**Fix:** Add polling intervals to critical queries:
+
+```typescript
+const query = useQuery({
+  queryKey: ["paper-portfolio"],
+  queryFn: ...,
+  refetchInterval: 10_000, // 10 seconds
+  refetchIntervalInBackground: true,
+});
+```
+
+Or implement a WebSocket connection to the backend for push updates.
+
+### 6.2 No Error Boundaries — Any API Failure Crashes the Full Page
+
+If the API returns an error, `useQuery` surfaces it but there are no `ErrorBoundary` components wrapping page-level sections. A single failing endpoint breaks the entire view.
+
+### 6.3 No Loading Skeletons — Flash of Empty Tables
+
+All tables render empty initially while data loads. Users see empty tables before data appears, which feels broken.
+
+### 6.4 Backtest Equity Curve Uses Raw Dates — Unreadable X-Axis
+
+```tsx
+<XAxis dataKey="ts" hide />
+```
+
+The X-axis is hidden entirely. A chart without a time axis loses its primary context for a time-series.
+
+### 6.5 No Strategy Performance Comparison Chart
+
+There is no chart that plots the equity curves of multiple strategies overlaid, which is the primary tool for strategy selection.
+
+### 6.6 Frontend Has No Dark Mode
+
+The body background is dark (`#08111f`) but the main content panels are `rgba(255,255,255,0.94)` — effectively white. This creates a jarring contrast and makes the app unsuitable for extended use at night (when most crypto traders are active).
+
+### 6.7 No Keyboard Shortcuts for Power Users
+
+Running a backtest, approving a ticket, and triggering a paper cycle are all mouse-only interactions. Power users need keyboard shortcuts.
+
+-----
+
+## Part 7 — Observability & Operations Gaps
+
+### 7.1 No Structured Logging to File or Aggregator
+
+`structlog` is imported and configured but logs only go to stdout. In production (Docker), logs need to be:
+
+- Persisted to rotating files
+- Forwarded to a log aggregator (Loki, Datadog, etc.)
+- Correlated with trace IDs across the request lifecycle
+
+### 7.2 No Metrics Endpoint (Prometheus)
+
+There is no `/metrics` endpoint exposing:
+
+- Trade count per strategy per hour
+- Bar processing latency
+- API request latency by endpoint
+- Queue depth
+- Open position count
+- Daily PnL
+
+Without this, you are flying blind in production.
+
+### 7.3 No Alerting on System Health Degradation
+
+If bar ingestion starts failing (exchange API down), the system silently serves stale data. There is no health degradation alert, no circuit breaker, and no fallback.
+
+### 7.4 No Backup Strategy for SQLite / DuckDB
+
+Both databases are mounted as Docker volumes. There is no automated backup, no point-in-time recovery, and no integrity check job. One Docker volume corruption event loses all trade history.
+
+### 7.5 No API Documentation / OpenAPI Enrichment
+
+FastAPI auto-generates OpenAPI docs but none of the endpoints have docstrings, response models, or example payloads. The `/docs` endpoint is effectively useless as-is.
+
+-----
+
+## Part 8 — Test Coverage Gaps
+
+### 8.1 No Test for the Paper Runner Full Cycle (Signal → Order → Fill → Position)
+
+`test_paper_runner.py` only tests the risk-block path. There is no test that verifies:
+
+- A valid signal with sufficient volume opens a position
+- A signal reversal closes the position
+- PnL is correctly calculated
+
+### 8.2 Perturbation and OOS Sharpe Are Never Tested
+
+Given that both are synthetic (bugs documented in Part 2), there is no test that would catch if they became genuinely wrong.
+
+### 8.3 No Integration Test for the Full Backtest → Promote → Paper Pipeline
+
+The most important user journey — run backtest, pass promotion, enable paper trading, receive paper trade — has no end-to-end test.
+
+### 8.4 No Test for HMAC Signing Logic
+
+The Binance adapter signing logic is never tested. A bug here in live mode would cause all orders to fail with `401 Invalid signature`.
+
+-----
+
+## Part 9 — Full Feature Roadmap
+
+Prioritized by value-to-effort ratio:
+
+### Sprint 1 — Fix Critical Correctness Bugs (1–2 days)
+
+1. Implement real perturbation Sharpe (noise injection loop)
+1. Implement real walk-forward OOS Sharpe
+1. Implement `trend_signal` feature computation (EMA crossover)
+1. Fix end-of-backtest open position not being closed
+1. Implement Binance funding rate ingestion
+1. Implement `atr_14` feature computation
+
+### Sprint 2 — Security Hardening (1 day)
+
+1. Rotate vault passphrase and auth tokens
+1. Generate random tokens in bootstrap script
+1. Add rate limiting middleware
+1. Fix HMAC call to use `hmac.HMAC`
+1. SQLite WAL mode + module-level connection cache
+1. Add pre-commit hook for secret scanning
+
+### Sprint 3 — Stop-Loss / Take-Profit / Alerts (2–3 days)
+
+1. Implement stop-loss and take-profit execution in paper runner
+1. Implement vol-targeted position sizing
+1. Telegram/Discord webhook notifications
+1. Alert triggers: position opened/closed, daily loss limit, kill switch
+
+### Sprint 4 — Real-Time Infrastructure (3–5 days)
+
+1. Binance WebSocket mark price stream
+1. Hyperliquid WebSocket stream
+1. Live P&L mark-to-market every 5 seconds
+1. Frontend polling or WebSocket connection for live data
+
+### Sprint 5 — Advanced Backtesting (3–5 days)
+
+1. Proper walk-forward optimization framework
+1. Monte Carlo trade resampling
+1. Portfolio-level backtest (multiple strategies simultaneously)
+1. Realistic slippage model (volume-proportional)
+1. Funding payment simulation in backtest
+
+### Sprint 6 — Open Interest & Liquidation Data (2–3 days)
+
+1. Binance `/fapi/v1/openInterest` history ingestion
+1. Binance `/futures/data/takerBuySellVol` ingestion
+1. `oi_change_pct`, `buy_sell_ratio`, `liquidation_intensity` features
+1. Strategy builder: expose new features in UI
+
+### Sprint 7 — Strategy Builder UI (3–5 days)
+
+1. Web-based rule builder (drag-and-drop RuleBlocks)
+1. Live feature preview on latest bar
+1. Strategy hypothesis text field with AI-assist via existing OpenRouter integration
+1. One-click backtest from builder
+
+### Sprint 8 — Observability (1–2 days)
+
+1. Prometheus `/metrics` endpoint
+1. Structured log forwarding configuration
+1. SQLite/DuckDB automated backup job
+1. Grafana dashboard template (backtest KPIs, paper PnL, system health)
+
+### Sprint 9 — Correlation & Portfolio Risk (2–3 days)
+
+1. Pairwise strategy return correlation matrix
+1. Portfolio VaR/CVaR using historical simulation
+1. Position sizing Kelly fraction calculator
+1. Probability of ruin estimation
+1. Cross-strategy exposure cap enforcement
+
+### Sprint 10 — Market Research Agent Enhancement (2 days)
+
+1. Connect market structure analysis to live feature data (currently takes a `feature_summary` dict but no caller populates it from live data)
+1. Scheduled daily research digest
+1. Catalyst agent wired to news API (Cryptopanic or TheBlock)
+1. Risk review agent triggered before any promotion approval
+
+-----
+
+## Part 10 — Quick-Win Code Improvements
+
+### 10.1 Strategy Registry Should Not Re-Bootstrap on Every List Call
+
+```python
+# registry.py — called on every GET /strategies
+def list_specs() -> list[dict]:
+    bootstrap_builtin_specs()  # ← DB write on every read request
+```
+
+Move `bootstrap_builtin_specs()` to the startup event only.
+
+### 10.2 `dataclass_to_dict` Recursion Is Fragile with Nested Tuples
+
+The equity curve is a `list[tuple[datetime, float]]`. After `dataclass_to_dict`, it becomes a `list[list]`. The frontend types this as `Array<[string, number]>` — this works but is fragile. Define an explicit `EquityPoint` dataclass.
+
+### 10.3 `fetch_all` with No Parameters Passes `[]` Silently
+
+```python
+def fetch_all(query: str, params: list | None = None) -> list:
+    ...
+    con.execute(query, params or [])
+```
+
+This hides parameter omission bugs. Make `params` required.
+
+### 10.4 Approval Route Hardcodes `'operator'` as `approved_by`
+
+```python
+# approvals.py
+con.execute("UPDATE ... SET approved_by='operator' ...")
+```
+
+Should use the authenticated user’s `display_name` from the `Depends(require_role("admin"))` dependency, which is already available.
+
+### 10.5 `run_bar` Import Is Inside a Function Body
+
+```python
+# paper/runner.py
+from backend.paper.broker import update_unrealized_pnl  # ← inside loop!
+```
+
+This import runs on every bar for every open position. Move it to module level.
+
+### 10.6 `compare_runs` Catches HTTPException but Silently Discards Errors
+
+```python
+except HTTPException:
+    comparisons.append({..., "sharpe": None, ...})
+```
+
+Non-HTTP exceptions (e.g., `DuckDBException`, `OSError`) are not caught and will abort the entire compare run. Catch `Exception` and log the error.
+
+-----
+
+## Part 11 — Schema Improvements
+
+### 11.1 Missing Indexes on Foreign Keys and Common Query Patterns
+
+The SQLite meta database has no explicit indexes beyond primary keys. Every `fetch_all` with a `WHERE spec_id=?` clause does a full table scan.
+
+**Required indexes:**
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_paper_positions_spec_id ON paper_positions(spec_id);
+CREATE INDEX IF NOT EXISTS idx_paper_positions_closed ON paper_positions(closed_at);
+CREATE INDEX IF NOT EXISTS idx_paper_orders_spec ON paper_orders(spec_id);
+CREATE INDEX IF NOT EXISTS idx_strategy_targets_spec ON strategy_targets(spec_id);
+CREATE INDEX IF NOT EXISTS idx_audit_events_type ON audit_events(event_type, created_at);
+CREATE INDEX IF NOT EXISTS idx_job_queue_status ON job_queue(status, priority, created_at);
+```
+
+### 11.2 No Schema Migration System
+
+As the schema evolves, there is no migration system. Adding a column requires manual SQL or dropping the database. Use `yoyo-migrations` or a simple versioned migration runner.
+
+### 11.3 `paper_positions` Has No `close_price` Column in Schema
+
+The broker calls `con.execute("UPDATE paper_positions SET close_price=? ...")` but `close_price` is not in the CREATE TABLE statement. This will silently fail on fresh databases.
+
+-----
+
+## Summary Scorecard
+
+|Dimension           |Current State                                          |Target State|
+|--------------------|-------------------------------------------------------|------------|
+|Security            |3/10 — secrets in repo, weak tokens, no rate limiting  |8/10        |
+|Correctness         |4/10 — 3 strategies produce zero trades, OOS is fake   |9/10        |
+|Reliability         |5/10 — no retry, no WAL, race conditions               |8/10        |
+|Feature Completeness|4/10 — no real-time, no stops, no funding data         |8/10        |
+|Observability       |3/10 — no metrics, no alerts, no backups               |7/10        |
+|Test Coverage       |5/10 — happy paths covered, critical paths missing     |8/10        |
+|Frontend UX         |5/10 — functional but stale, no dark mode, no real-time|7/10        |
+|**Overall**         |**4.1/10**                                             |**8/10**    |
+
+-----
+
+## Immediate Action Items (Do These First)
+
+1. **Rotate** `VAULT_PASSPHRASE` and all auth tokens right now — they are in git history
+1. **Fix** perturbation + OOS Sharpe computation — the promotion gate is currently meaningless
+1. **Implement** `trend_signal` and `atr_14` features — two of three strategies produce zero trades
+1. **Implement** Binance funding rate ingestion — funding mean-reversion strategy is completely broken
+1. **Add** SQLite WAL mode — concurrent access will cause lock errors in production
+1. **Fix** the in-loop import in `paper/runner.py` — it’s a performance bug that fires on every bar
+1. **Add** stop-loss execution to paper runner — running without stops is not serious algo trading
+1. **Add** `refetchInterval` to paper portfolio query — stale positions are an operational hazard
+
+-----
+
+*This review was conducted against codebase version 0.1.0. The architecture and vision are sound — the gaps are implementation-level, not conceptual. With the corrections above, this system can become a genuinely powerful and trustworthy crypto research and paper trading platform.*

@@ -7,6 +7,7 @@ import httpx
 import pandas as pd
 
 from backend.core.config import settings
+from backend.core.retry import retry_async
 from backend.core.types import Instrument, Timeframe
 
 TF_MAP = {
@@ -22,15 +23,17 @@ async def fetch_bars(inst: Instrument, tf: Timeframe, start: datetime, end: date
     end_ms = int(end.timestamp() * 1000)
     async with httpx.AsyncClient(timeout=30) as client:
         while cursor < end_ms:
-            response = await client.get(
-                f"{settings.binance_base_url}/fapi/v1/klines",
-                params={
-                    "symbol": inst.venue_symbol,
-                    "interval": TF_MAP[tf],
-                    "startTime": cursor,
-                    "endTime": end_ms,
-                    "limit": 1500,
-                },
+            response = await retry_async(
+                lambda: client.get(
+                    f"{settings.binance_base_url}/fapi/v1/klines",
+                    params={
+                        "symbol": inst.venue_symbol,
+                        "interval": TF_MAP[tf],
+                        "startTime": cursor,
+                        "endTime": end_ms,
+                        "limit": 1500,
+                    },
+                ),
             )
             response.raise_for_status()
             chunk = response.json()
@@ -75,14 +78,16 @@ async def fetch_bars(inst: Instrument, tf: Timeframe, start: datetime, end: date
 
 async def fetch_funding_history(inst: Instrument, start: datetime, end: datetime) -> pd.DataFrame:
     async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.get(
-            f"{settings.binance_base_url}/fapi/v1/fundingRate",
-            params={
-                "symbol": inst.venue_symbol,
-                "startTime": int(start.timestamp() * 1000),
-                "endTime": int(end.timestamp() * 1000),
-                "limit": 1000,
-            },
+        response = await retry_async(
+            lambda: client.get(
+                f"{settings.binance_base_url}/fapi/v1/fundingRate",
+                params={
+                    "symbol": inst.venue_symbol,
+                    "startTime": int(start.timestamp() * 1000),
+                    "endTime": int(end.timestamp() * 1000),
+                    "limit": 1000,
+                },
+            ),
         )
         response.raise_for_status()
     data = response.json()
@@ -92,3 +97,92 @@ async def fetch_funding_history(inst: Instrument, start: datetime, end: datetime
     df["ts"] = pd.to_datetime(df["fundingTime"], unit="ms", utc=True)
     df["rate"] = df["fundingRate"].astype(float)
     return df[["ts", "rate"]]
+
+
+async def fetch_open_interest_history(inst: Instrument, period: str = "1h", limit: int = 500) -> pd.DataFrame:
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await retry_async(
+            lambda: client.get(
+                f"{settings.binance_base_url}/futures/data/openInterestHist",
+                params={"symbol": inst.venue_symbol, "period": period, "limit": limit},
+            )
+        )
+        response.raise_for_status()
+    rows = response.json()
+    if not rows:
+        return pd.DataFrame(columns=["ts", "open_interest"])
+    df = pd.DataFrame(rows)
+    df["ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df["open_interest"] = df["sumOpenInterestValue"].astype(float)
+    return df[["ts", "open_interest"]]
+
+
+async def fetch_taker_buy_sell_volume(inst: Instrument, period: str = "1h", limit: int = 500) -> pd.DataFrame:
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await retry_async(
+            lambda: client.get(
+                f"{settings.binance_base_url}/futures/data/takerBuySellVol",
+                params={"symbol": inst.venue_symbol, "period": period, "limit": limit},
+            )
+        )
+        response.raise_for_status()
+    rows = response.json()
+    if not rows:
+        return pd.DataFrame(columns=["ts", "taker_buy_volume", "taker_sell_volume"])
+    df = pd.DataFrame(rows)
+    df["ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df["taker_buy_volume"] = df["takerBuyVolValue"].astype(float)
+    df["taker_sell_volume"] = df["takerSellVolValue"].astype(float)
+    return df[["ts", "taker_buy_volume", "taker_sell_volume"]]
+
+
+async def fetch_liquidation_history(inst: Instrument, period: str = "1h", limit: int = 500) -> pd.DataFrame:
+    safe_limit = max(1, min(int(limit), 100))
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await retry_async(
+            lambda: client.get(
+                f"{settings.binance_base_url}/futures/data/allForceOrders",
+                params={"symbol": inst.venue_symbol, "autoCloseType": "LIQUIDATION", "limit": safe_limit},
+            )
+        )
+        response.raise_for_status()
+    rows = response.json()
+    if not rows:
+        return pd.DataFrame(columns=["ts", "liquidation_volume"])
+    df = pd.DataFrame(rows)
+    df["ts"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+    avg_px = pd.to_numeric(df.get("averagePrice"), errors="coerce").fillna(0.0)
+    exec_qty = pd.to_numeric(df.get("executedQty"), errors="coerce").fillna(0.0)
+    df["liquidation_volume"] = avg_px * exec_qty
+    grouped = (
+        df.set_index("ts")
+        .resample(period)
+        .agg(liquidation_volume=("liquidation_volume", "sum"))
+        .reset_index()
+        .sort_values("ts")
+    )
+    return grouped[["ts", "liquidation_volume"]]
+
+
+async def fetch_order_book_snapshot(inst: Instrument) -> dict:
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await retry_async(
+            lambda: client.get(
+                f"{settings.binance_base_url}/fapi/v1/depth",
+                params={"symbol": inst.venue_symbol, "limit": 20},
+            )
+        )
+        response.raise_for_status()
+    data = response.json()
+    bids = data.get("bids", [])
+    asks = data.get("asks", [])
+    if not bids or not asks:
+        return {"spread_bps": 0.0, "orderbook_imbalance": 0.0}
+    best_bid = float(bids[0][0])
+    best_ask = float(asks[0][0])
+    spread_bps = ((best_ask - best_bid) / best_bid) * 10_000 if best_bid else 0.0
+    bid_depth = sum(float(item[1]) for item in bids[:10])
+    ask_depth = sum(float(item[1]) for item in asks[:10])
+    denom = bid_depth + ask_depth
+    imbalance = ((bid_depth - ask_depth) / denom) if denom else 0.0
+    return {"spread_bps": spread_bps, "orderbook_imbalance": imbalance}

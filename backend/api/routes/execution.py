@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
+from backend.api.rate_limit import enforce_rate_limit
 from backend.auth.service import require_role
+from backend.core.config import settings
 from backend.execution.service import (
     approve_execution_ticket,
     create_execution_ticket,
@@ -12,7 +14,7 @@ from backend.execution.service import (
     reconcile_venue,
     reject_execution_ticket,
 )
-from backend.worker.jobs import list_jobs
+from backend.worker.jobs import list_dead_letters, list_jobs
 from backend.worker.service import job_metrics, process_next_job
 
 router = APIRouter()
@@ -37,14 +39,36 @@ def create_ticket(payload: dict, user: dict = Depends(require_role("operator")))
     )
 
 
-@router.post("/tickets/{ticket_id}/approve")
-def approve_ticket(ticket_id: str, payload: dict | None = None, user: dict = Depends(require_role("admin"))) -> dict:
+@router.post("/tickets/{ticket_id}/approve", summary="Approve execution ticket")
+def approve_ticket(
+    ticket_id: str,
+    request: Request,
+    payload: dict | None = None,
+    user: dict = Depends(require_role("admin")),
+) -> dict:
+    enforce_rate_limit(
+        request,
+        bucket="execution_ticket_approve",
+        limit=settings.api_rate_limit_ticket_approve_per_minute,
+        window_seconds=60,
+    )
     approved_by = (payload or {}).get("approved_by", user["display_name"])
     return approve_execution_ticket(ticket_id, approved_by=approved_by)
 
 
-@router.post("/tickets/{ticket_id}/reject")
-def reject_ticket(ticket_id: str, payload: dict | None = None, user: dict = Depends(require_role("admin"))) -> dict:
+@router.post("/tickets/{ticket_id}/reject", summary="Reject execution ticket")
+def reject_ticket(
+    ticket_id: str,
+    request: Request,
+    payload: dict | None = None,
+    user: dict = Depends(require_role("admin")),
+) -> dict:
+    enforce_rate_limit(
+        request,
+        bucket="execution_ticket_reject",
+        limit=settings.api_rate_limit_ticket_approve_per_minute,
+        window_seconds=60,
+    )
     reason = (payload or {}).get("reason", "operator_rejected")
     rejected_by = (payload or {}).get("rejected_by", user["display_name"])
     return reject_execution_ticket(ticket_id, reason=reason, rejected_by=rejected_by)
@@ -69,6 +93,11 @@ def run_reconciliation(payload: dict | None = None, user: dict = Depends(require
 @router.get("/jobs")
 def jobs(limit: int = 100) -> list[dict]:
     return list_jobs(limit=limit)
+
+
+@router.get("/jobs/dead-letters")
+def dead_letters(limit: int = 100) -> list[dict]:
+    return list_dead_letters(limit=limit)
 
 
 @router.get("/jobs/metrics")

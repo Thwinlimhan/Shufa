@@ -25,7 +25,7 @@ def record_audit_event(event_type: str, entity_type: str, entity_id: str, payloa
 
 
 def list_audit_events(limit: int = 50) -> list[dict]:
-    rows = fetch_all(f"SELECT * FROM audit_events ORDER BY created_at DESC LIMIT {int(limit)}")
+    rows = fetch_all("SELECT * FROM audit_events ORDER BY created_at DESC LIMIT ?", [int(limit)])
     return [
         {
             "event_id": row["event_id"],
@@ -70,7 +70,7 @@ def record_paper_cycle_event(
 
 
 def list_paper_cycle_events(limit: int = 100) -> list[dict]:
-    rows = fetch_all(f"SELECT * FROM paper_cycle_events ORDER BY created_at DESC LIMIT {int(limit)}")
+    rows = fetch_all("SELECT * FROM paper_cycle_events ORDER BY created_at DESC LIMIT ?", [int(limit)])
     return [
         {
             "event_id": row["event_id"],

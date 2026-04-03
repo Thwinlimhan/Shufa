@@ -26,6 +26,7 @@ type ReadinessResponse = {
     live_trading_enabled: boolean;
     live_approval_mode: boolean;
     paper_max_open_positions: number;
+    paper_max_gross_exposure_usd: number;
     paper_daily_loss_limit_usd: number;
     live_secrets: {
       all_present: boolean;
@@ -73,6 +74,11 @@ type VaultStatus = {
   required_keys: string[];
 };
 
+type WorkerHealth = {
+  healthy: boolean;
+  workers: Array<{ worker_id: string; healthy: boolean; last_seen: string; status: string }>;
+};
+
 function statusText(value: boolean) {
   return value ? "Ready" : "Blocked";
 }
@@ -84,21 +90,39 @@ export function SettingsPage() {
   const [vaultMessage, setVaultMessage] = useState("");
   const readiness = useQuery({
     queryKey: ["ops-readiness"],
-    queryFn: () => apiGet<ReadinessResponse>("/ops/readiness")
+    queryFn: () => apiGet<ReadinessResponse>("/ops/readiness"),
+    refetchInterval: 20_000,
+    refetchIntervalInBackground: true
   });
   const audit = useQuery({
     queryKey: ["ops-audit"],
-    queryFn: () => apiGet<AuditRow[]>("/ops/audit?limit=20")
+    queryFn: () => apiGet<AuditRow[]>("/ops/audit?limit=20"),
+    refetchInterval: 20_000,
+    refetchIntervalInBackground: true
   });
   const paperEvents = useQuery({
     queryKey: ["ops-paper-events"],
-    queryFn: () => apiGet<PaperEventRow[]>("/ops/paper-events?limit=20")
+    queryFn: () => apiGet<PaperEventRow[]>("/ops/paper-events?limit=20"),
+    refetchInterval: 20_000,
+    refetchIntervalInBackground: true
   });
   const vault = useQuery({
     queryKey: ["vault-status"],
     queryFn: () => apiGet<VaultStatus>("/vault/status"),
     retry: false
   });
+  const workerHealth = useQuery({
+    queryKey: ["ops-worker-health"],
+    queryFn: () => apiGet<WorkerHealth>("/ops/worker-health"),
+    refetchInterval: 15_000,
+    refetchIntervalInBackground: true
+  });
+  if (readiness.isLoading || audit.isLoading || paperEvents.isLoading) {
+    return <section className="panel skeleton-block">Loading operations snapshot...</section>;
+  }
+  if (readiness.isError || audit.isError || paperEvents.isError) {
+    return <section className="panel">Failed to load operations snapshot.</section>;
+  }
 
   const data = readiness.data;
 
@@ -269,8 +293,16 @@ export function SettingsPage() {
               <span>${Number(data?.risk.paper_daily_loss_limit_usd ?? 0).toFixed(0)}</span>
             </div>
             <div>
+              <strong>Gross Exposure Cap</strong>
+              <span>${Number(data?.risk.paper_max_gross_exposure_usd ?? 0).toFixed(0)}</span>
+            </div>
+            <div>
               <strong>Live Secrets</strong>
               <span>{data?.risk.live_secrets?.all_present ? "ready" : "missing"}</span>
+            </div>
+            <div>
+              <strong>Worker Health</strong>
+              <span>{workerHealth.data?.healthy ? "healthy" : "degraded"}</span>
             </div>
           </div>
 

@@ -94,6 +94,7 @@ def fill_order(order: PaperOrder, bar_close_price: float) -> PaperOrder:
 
 
 def open_position(order: PaperOrder) -> PaperPosition:
+    entry_fee = order.size_usd * (settings.paper_fee_bps / 10_000)
     position = PaperPosition(
         position_id=str(uuid.uuid4()),
         spec_id=order.spec_id,
@@ -102,14 +103,15 @@ def open_position(order: PaperOrder) -> PaperPosition:
         opened_at=order.filled_at or datetime.now(timezone.utc),
         entry_price=order.fill_price or Decimal("0"),
         size_usd=order.size_usd,
+        entry_fees_usd=entry_fee,
     )
     con = get_sqlite()
     con.execute(
         """
         INSERT INTO paper_positions (
             position_id, spec_id, instrument_json, direction, opened_at,
-            entry_price, size_usd, unrealized_pnl_usd, accrued_funding_usd
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            entry_price, size_usd, unrealized_pnl_usd, accrued_funding_usd, entry_fees_usd
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             position.position_id,
@@ -121,6 +123,7 @@ def open_position(order: PaperOrder) -> PaperPosition:
             position.size_usd,
             position.unrealized_pnl_usd,
             position.accrued_funding_usd,
+            position.entry_fees_usd,
         ),
     )
     con.commit()
@@ -145,7 +148,8 @@ def close_position(position: PaperPosition, fill_price: float) -> float:
     raw_pnl = ((fill_price - entry) / entry) * position.size_usd if entry else 0.0
     if position.direction == "short":
         raw_pnl = -raw_pnl
-    realized = raw_pnl + position.accrued_funding_usd
+    exit_fee = position.size_usd * (settings.paper_fee_bps / 10_000)
+    realized = raw_pnl + position.accrued_funding_usd - position.entry_fees_usd - exit_fee
     con = get_sqlite()
     con.execute(
         """

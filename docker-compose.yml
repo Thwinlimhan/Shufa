@@ -9,6 +9,11 @@ services:
       - ./data:/app/data
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
 
   worker:
     build:
@@ -22,6 +27,17 @@ services:
       - ./data:/app/data
     depends_on:
       - api
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import sqlite3,datetime; con=sqlite3.connect('/app/data/meta/workbench.db'); row=con.execute(\"SELECT last_seen FROM worker_heartbeat ORDER BY last_seen DESC LIMIT 1\").fetchone(); assert row and (datetime.datetime.now(datetime.timezone.utc)-datetime.datetime.fromisoformat(row[0])).total_seconds()<45",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
 
   frontend:
     build:

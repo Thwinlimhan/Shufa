@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 import httpx
 
 from backend.core.config import settings
+from backend.core.retry import retry_sync
 from backend.core.types import Instrument
 from backend.secrets.vault import secret_or_env
 
@@ -147,17 +148,19 @@ class BinanceFuturesAdapter(LiveExecutionAdapter):
         return int(datetime.now(timezone.utc).timestamp() * 1000)
 
     def _mark_price(self, instrument: Instrument) -> Decimal:
-        response = httpx.get(
-            f"{self.base_url}/fapi/v1/premiumIndex",
-            params={"symbol": instrument.venue_symbol},
-            timeout=10.0,
+        response = retry_sync(
+            lambda: httpx.get(
+                f"{self.base_url}/fapi/v1/premiumIndex",
+                params={"symbol": instrument.venue_symbol},
+                timeout=10.0,
+            )
         )
         response.raise_for_status()
         payload = response.json()
         return Decimal(str(payload["markPrice"]))
 
     def _quantity_for_notional(self, instrument: Instrument, size_usd: float, mark_price: Decimal) -> str:
-        info = httpx.get(f"{self.base_url}/fapi/v1/exchangeInfo", timeout=10.0)
+        info = retry_sync(lambda: httpx.get(f"{self.base_url}/fapi/v1/exchangeInfo", timeout=10.0))
         info.raise_for_status()
         symbol_info = next(item for item in info.json()["symbols"] if item["symbol"] == instrument.venue_symbol)
         quantity_precision = int(symbol_info.get("quantityPrecision", 3))
@@ -168,10 +171,14 @@ class BinanceFuturesAdapter(LiveExecutionAdapter):
 
     def _signed_request(self, method: str, path: str, params: dict) -> dict:
         query = urlencode(params, doseq=True)
-        signature = hmac.new(self.api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+        signature = hmac.HMAC(
+            self.api_secret.encode("utf-8"),
+            query.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
         headers = {"X-MBX-APIKEY": self.api_key}
         with httpx.Client(base_url=self.base_url, timeout=15.0, headers=headers) as client:
-            response = client.request(method, f"{path}?{query}&signature={signature}")
+            response = retry_sync(lambda: client.request(method, f"{path}?{query}&signature={signature}"))
             response.raise_for_status()
             return response.json()
 

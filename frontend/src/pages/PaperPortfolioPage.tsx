@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { useEffect } from "react";
 import { apiGet, apiPost } from "../api/client";
 import { MetricCard } from "../components/MetricCard";
 
@@ -13,8 +14,39 @@ type PortfolioResponse = {
 export function PaperPortfolioPage() {
   const query = useQuery({
     queryKey: ["paper-portfolio"],
-    queryFn: () => apiGet<PortfolioResponse>("/paper/portfolio")
+    queryFn: () => apiGet<PortfolioResponse>("/paper/portfolio"),
+    refetchInterval: 10_000,
+    refetchIntervalInBackground: true
   });
+  async function runPaperCycle() {
+    await apiPost("/paper/run-once");
+    await query.refetch();
+  }
+
+  async function runKillSwitch() {
+    await apiPost("/paper/kill");
+    await query.refetch();
+  }
+
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if (event.altKey && event.key.toLowerCase() === "r") {
+        void runPaperCycle();
+      }
+      if (event.altKey && event.key.toLowerCase() === "k") {
+        void runKillSwitch();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
+  if (query.isLoading) {
+    return <section className="panel skeleton-block">Loading paper portfolio...</section>;
+  }
+  if (query.isError) {
+    return <section className="panel">Failed to load paper portfolio.</section>;
+  }
 
   const data = query.data;
 
@@ -26,8 +58,8 @@ export function PaperPortfolioPage() {
           <p>Open positions, recent fills, and emergency controls.</p>
         </div>
         <div className="button-row">
-          <button onClick={() => apiPost("/paper/run-once").then(() => query.refetch())}>Run Paper Cycle</button>
-          <button onClick={() => apiPost("/paper/kill").then(() => query.refetch())}>Kill Switch</button>
+          <button onClick={() => void runPaperCycle()}>Run Paper Cycle</button>
+          <button onClick={() => void runKillSwitch()}>Kill Switch</button>
         </div>
       </div>
 
@@ -137,6 +169,8 @@ export function PaperPortfolioPage() {
             <th>Direction</th>
             <th>Opened</th>
             <th>Entry</th>
+            <th>Mark</th>
+            <th>Unrealized</th>
             <th>Size USD</th>
           </tr>
         </thead>
@@ -150,6 +184,8 @@ export function PaperPortfolioPage() {
               <td>{row.direction}</td>
               <td>{row.opened_at ? new Date(String(row.opened_at)).toLocaleString() : "n/a"}</td>
               <td>{row.entry_price}</td>
+              <td>{row.mark_price ?? "n/a"}</td>
+              <td>${Number(row.unrealized_pnl_usd ?? 0).toFixed(2)}</td>
               <td>{row.size_usd}</td>
             </tr>
           ))}

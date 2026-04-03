@@ -55,7 +55,7 @@ type BacktestRow = {
       signal_counts?: Record<string, number>;
       feature_ranges?: Record<string, { min: number; max: number }>;
     };
-    equity_curve: Array<[string, number]>;
+    equity_curve: Array<[string, number] | { ts: string; equity: number }>;
     trades: Array<{
       trade_id: string;
       direction: string;
@@ -96,6 +96,21 @@ type TargetSnapshot = {
 };
 
 const LOOKBACK_OPTIONS = [60, 120, 180, 365];
+const BUILDER_FEATURES = [
+  "ret_4",
+  "vol_ratio",
+  "trend_signal",
+  "funding_zscore",
+  "rsi_14",
+  "pct_rank_20",
+  "oi_change_pct",
+  "buy_sell_ratio",
+  "liquidation_intensity",
+  "btc_ret_1",
+  "rel_strength_20",
+  "beta_btc_20",
+  "onchain_pressure"
+];
 const STATUS_PRIORITY: Record<string, number> = {
   rejected: 0,
   proposed: 1,
@@ -112,14 +127,23 @@ export function StrategyRegistryPage() {
   const [statusMessage, setStatusMessage] = useState<string>("");
   const [compareRows, setCompareRows] = useState<CompareRow[]>([]);
   const [sweepRows, setSweepRows] = useState<SweepRow[]>([]);
+  const [builderName, setBuilderName] = useState<string>("Custom Signal");
+  const [builderHypothesis, setBuilderHypothesis] = useState<string>("User-defined strategy idea.");
+  const [builderFeature, setBuilderFeature] = useState<string>("ret_4");
+  const [builderOperator, setBuilderOperator] = useState<string>("gt");
+  const [builderThreshold, setBuilderThreshold] = useState<number>(0.01);
 
   const strategies = useQuery({
     queryKey: ["strategies"],
-    queryFn: () => apiGet<StrategyRow[]>("/strategies")
+    queryFn: () => apiGet<StrategyRow[]>("/strategies"),
+    refetchInterval: 30_000,
+    refetchIntervalInBackground: true
   });
   const backtests = useQuery({
     queryKey: ["backtests"],
-    queryFn: () => apiGet<BacktestRow[]>("/backtests")
+    queryFn: () => apiGet<BacktestRow[]>("/backtests"),
+    refetchInterval: 30_000,
+    refetchIntervalInBackground: true
   });
 
   useEffect(() => {
@@ -201,11 +225,27 @@ export function StrategyRegistryPage() {
   const bestTarget = targetSnapshots[0];
   const equityData = useMemo(
     () =>
-      (selectedRun?.result.equity_curve ?? []).map(([ts, value]) => ({
-        ts: new Date(ts).toLocaleDateString(),
-        equity: Number(value.toFixed(2))
-      })),
+      (selectedRun?.result.equity_curve ?? []).map((point) => {
+        const ts = Array.isArray(point) ? point[0] : point.ts;
+        const value = Array.isArray(point) ? point[1] : point.equity;
+        return {
+          ts,
+          tsLabel: new Date(ts).toLocaleDateString(),
+          equity: Number(Number(value).toFixed(2))
+        };
+      }),
     [selectedRun]
+  );
+  const comparisonChartData = useMemo(
+    () =>
+      targetSnapshots
+        .slice(0, 5)
+        .map((item) => ({
+          label: `${item.symbol}/${item.venue}`,
+          sharpe: Number(item.run?.result.sharpe?.toFixed(2) ?? 0),
+          returnPct: Number(item.run?.result.total_return_pct?.toFixed(2) ?? 0)
+        })),
+    [targetSnapshots]
   );
 
   async function runBacktest(specId: string, symbol: string, venue: string) {
@@ -277,6 +317,53 @@ export function StrategyRegistryPage() {
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : "Target update failed.");
     }
+  }
+
+  async function createStrategyFromBuilder() {
+    const specId = `custom-${builderName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "")}`;
+    const payload = {
+      spec_id: specId,
+      name: builderName,
+      version: 1,
+      created_at: new Date().toISOString(),
+      universe: [{ symbol: selectedSymbol, venue: selectedVenue, mode: "perp", quote: "USDT" }],
+      primary_timeframe: "1h",
+      feature_inputs: [builderFeature],
+      entry_long: [{ feature: builderFeature, operator: builderOperator, threshold: builderThreshold }],
+      entry_short: [{ feature: builderFeature, operator: builderOperator === "gt" ? "lt" : "gt", threshold: builderThreshold }],
+      sizing: { method: "fixed_notional", fixed_notional_usd: 1000 },
+      risk_limits: { max_open_positions: 4 },
+      execution: { bar_close_only: true, min_volume_usd: 500000, max_spread_bps: 10 },
+      hypothesis: builderHypothesis,
+      tags: ["custom", "ui-builder"]
+    };
+    setStatusMessage("Creating strategy from builder...");
+    try {
+      await apiPost("/strategies", payload);
+      await strategies.refetch();
+      setSelectedSpecId(specId);
+      setStatusMessage(`Created ${specId}.`);
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : "Builder create failed.");
+    }
+  }
+
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if (!selectedStrategy) return;
+      if (event.altKey && event.key.toLowerCase() === "b") {
+        void runBacktest(selectedStrategy.spec_id, selectedSymbol, selectedVenue);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [selectedStrategy, selectedSymbol, selectedVenue, lookbackDays]);
+
+  if (strategies.isLoading || backtests.isLoading) {
+    return <section className="panel skeleton-block">Loading strategy registry...</section>;
+  }
+  if (strategies.isError || backtests.isError) {
+    return <section className="panel">Failed to load strategy registry.</section>;
   }
 
   return (
@@ -392,6 +479,49 @@ export function StrategyRegistryPage() {
       <div className="panel">
         <div className="panel-header">
           <div>
+            <h2>Strategy Builder</h2>
+            <p>Create a rule-based strategy without editing Python.</p>
+          </div>
+        </div>
+        <div className="control-grid">
+          <label className="field">
+            <span>Name</span>
+            <input value={builderName} onChange={(event) => setBuilderName(event.target.value)} />
+          </label>
+          <label className="field">
+            <span>Feature</span>
+            <select value={builderFeature} onChange={(event) => setBuilderFeature(event.target.value)}>
+              {BUILDER_FEATURES.map((feature) => (
+                <option key={feature} value={feature}>
+                  {feature}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field">
+            <span>Operator</span>
+            <select value={builderOperator} onChange={(event) => setBuilderOperator(event.target.value)}>
+              <option value="gt">gt</option>
+              <option value="lt">lt</option>
+            </select>
+          </label>
+          <label className="field">
+            <span>Threshold</span>
+            <input type="number" value={builderThreshold} onChange={(event) => setBuilderThreshold(Number(event.target.value))} />
+          </label>
+        </div>
+        <label className="field">
+          <span>Hypothesis</span>
+          <input value={builderHypothesis} onChange={(event) => setBuilderHypothesis(event.target.value)} />
+        </label>
+        <div className="button-row">
+          <button onClick={createStrategyFromBuilder}>Save Strategy</button>
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="panel-header">
+          <div>
             <h2>Strategy Table</h2>
             <p>Built-in specs stay proposed until the evidence is good enough to promote them.</p>
           </div>
@@ -484,14 +614,31 @@ export function StrategyRegistryPage() {
             {equityData.length > 0 ? (
               <ResponsiveContainer width="100%" height={280}>
                 <LineChart data={equityData}>
-                  <XAxis dataKey="ts" hide />
-                  <YAxis hide domain={["dataMin", "dataMax"]} />
-                  <Tooltip />
+                  <XAxis dataKey="tsLabel" minTickGap={30} />
+                  <YAxis domain={["dataMin", "dataMax"]} width={84} />
+                  <Tooltip labelFormatter={(value) => String(value)} />
                   <Line type="monotone" dataKey="equity" stroke="#ff8f00" strokeWidth={3} dot={false} />
                 </LineChart>
               </ResponsiveContainer>
             ) : (
               <div className="empty-state">No equity curve yet. Run a backtest first.</div>
+            )}
+          </div>
+
+          <div className="chart-shell">
+            {comparisonChartData.length > 0 ? (
+              <ResponsiveContainer width="100%" height={220}>
+                <LineChart data={comparisonChartData}>
+                  <XAxis dataKey="label" />
+                  <YAxis yAxisId="left" width={62} />
+                  <YAxis yAxisId="right" orientation="right" width={72} />
+                  <Tooltip />
+                  <Line yAxisId="left" type="monotone" dataKey="sharpe" stroke="#00adb5" strokeWidth={2} dot />
+                  <Line yAxisId="right" type="monotone" dataKey="returnPct" stroke="#ff8f00" strokeWidth={2} dot />
+                </LineChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className="empty-state">No comparison data yet.</div>
             )}
           </div>
 

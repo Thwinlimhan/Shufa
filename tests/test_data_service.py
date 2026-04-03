@@ -12,6 +12,7 @@ def _set_temp_paths(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(storage, "RAW_ROOT", tmp_path / "raw")
     monkeypatch.setattr(storage, "CURATED_DB", tmp_path / "curated" / "workbench.duckdb")
     monkeypatch.setattr(storage, "META_DB", tmp_path / "meta" / "workbench.db")
+    storage.reset_sqlite_connection()
 
 
 def test_ingest_bars_writes_parquet_and_health(monkeypatch, tmp_path) -> None:
@@ -69,7 +70,15 @@ def test_latest_feature_bar_returns_computed_fields(monkeypatch, tmp_path) -> No
     async def fake_funding(*args, **kwargs):
         return pd.DataFrame(columns=["ts", "rate"])
 
+    async def fake_context(*args, **kwargs):
+        return {
+            "open_interest": pd.DataFrame(columns=["ts", "open_interest"]),
+            "taker_flow": pd.DataFrame(columns=["ts", "taker_buy_volume", "taker_sell_volume"]),
+            "liquidations": pd.DataFrame(columns=["ts", "liquidation_volume"]),
+        }
+
     monkeypatch.setattr(service, "load_funding_like_series_async", fake_funding)
+    monkeypatch.setattr(service, "fetch_market_context_series", fake_context)
 
     latest = service.latest_feature_bar(inst, Timeframe.H1)
 
@@ -106,7 +115,15 @@ def test_funding_feature_range_moves_off_zero_when_history_exists(monkeypatch, t
             }
         )
 
+    async def fake_context(*args, **kwargs):
+        return {
+            "open_interest": pd.DataFrame(columns=["ts", "open_interest"]),
+            "taker_flow": pd.DataFrame(columns=["ts", "taker_buy_volume", "taker_sell_volume"]),
+            "liquidations": pd.DataFrame(columns=["ts", "liquidation_volume"]),
+        }
+
     monkeypatch.setattr(service, "load_funding_like_series_async", fake_funding)
+    monkeypatch.setattr(service, "fetch_market_context_series", fake_context)
     latest = service.latest_feature_bar(inst, Timeframe.H1)
 
     assert latest is not None

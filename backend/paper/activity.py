@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from backend.data.storage import fetch_all
+from backend.core.types import Instrument, Venue, VenueMode
+from backend.data.storage import fetch_all, get_mark_price
+from backend.ops.metrics import PAPER_POSITION_GAUGE
 from backend.strategy.targets import list_active_paper_targets
 
 
@@ -18,19 +20,22 @@ def _decode_instrument(raw_json: str) -> dict:
 
 
 def list_open_positions() -> list[dict]:
-    rows = fetch_all("SELECT * FROM paper_positions WHERE closed_at IS NULL ORDER BY opened_at DESC")
+    rows = fetch_all("SELECT * FROM paper_positions WHERE closed_at IS NULL ORDER BY opened_at DESC", [])
     positions: list[dict] = []
     for row in rows:
         item = dict(row)
         item.update(_decode_instrument(item.pop("instrument_json")))
+        instrument = Instrument(symbol=item["symbol"], venue=Venue(item["venue"]), mode=VenueMode(item.get("mode", "perp")))
+        mark = get_mark_price(instrument.key)
+        if mark:
+            item["mark_price"] = mark["price"]
+            item["mark_ts"] = mark["ts"]
         positions.append(item)
     return positions
 
 
 def list_recent_positions(limit: int = 100) -> list[dict]:
-    rows = fetch_all(
-        f"SELECT * FROM paper_positions ORDER BY COALESCE(closed_at, opened_at) DESC LIMIT {int(limit)}"
-    )
+    rows = fetch_all("SELECT * FROM paper_positions ORDER BY COALESCE(closed_at, opened_at) DESC LIMIT ?", [int(limit)])
     positions: list[dict] = []
     for row in rows:
         item = dict(row)
@@ -40,9 +45,7 @@ def list_recent_positions(limit: int = 100) -> list[dict]:
 
 
 def list_recent_orders(limit: int = 50) -> list[dict]:
-    rows = fetch_all(
-        f"SELECT * FROM paper_orders ORDER BY COALESCE(filled_at, triggered_at) DESC LIMIT {int(limit)}"
-    )
+    rows = fetch_all("SELECT * FROM paper_orders ORDER BY COALESCE(filled_at, triggered_at) DESC LIMIT ?", [int(limit)])
     orders: list[dict] = []
     for row in rows:
         item = dict(row)
@@ -119,6 +122,7 @@ def summarize_target_activity(limit: int = 50) -> tuple[list[dict], list[dict], 
 
 def portfolio_snapshot(limit: int = 50) -> dict:
     positions = list_open_positions()
+    PAPER_POSITION_GAUGE.set(len(positions))
     active_targets, target_activity, recent_orders = summarize_target_activity(limit=limit)
     total_unrealized = sum(float(position["unrealized_pnl_usd"]) for position in positions)
     return {

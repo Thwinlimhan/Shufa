@@ -12,6 +12,7 @@ def _set_temp_paths(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(storage, "RAW_ROOT", tmp_path / "raw")
     monkeypatch.setattr(storage, "CURATED_DB", tmp_path / "curated" / "workbench.duckdb")
     monkeypatch.setattr(storage, "META_DB", tmp_path / "meta" / "workbench.db")
+    storage.reset_sqlite_connection()
 
 
 def test_create_execution_ticket_builds_preview(monkeypatch, tmp_path) -> None:

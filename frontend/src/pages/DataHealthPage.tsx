@@ -14,8 +14,16 @@ type HealthRow = {
 export function DataHealthPage() {
   const query = useQuery({
     queryKey: ["data-health"],
-    queryFn: () => apiGet<HealthRow[]>("/data/health")
+    queryFn: () => apiGet<HealthRow[]>("/data/health"),
+    refetchInterval: 30_000,
+    refetchIntervalInBackground: true
   });
+  if (query.isLoading) {
+    return <section className="panel skeleton-block">Loading data health...</section>;
+  }
+  if (query.isError) {
+    return <section className="panel">Failed to load data health.</section>;
+  }
 
   return (
     <section className="panel">
@@ -27,6 +35,15 @@ export function DataHealthPage() {
         <div className="button-row">
           <button onClick={() => apiPost("/data/ingest", { lookback_days: 30 }).then(() => query.refetch())}>
             Ingest 30d
+          </button>
+          <button className="secondary-button" onClick={() => apiPost("/data/funding/ingest", { lookback_days: 14 })}>
+            Ingest Funding
+          </button>
+          <button
+            className="secondary-button"
+            onClick={() => apiPost("/data/market-context/ingest", { lookback_days: 14 })}
+          >
+            Ingest Context
           </button>
           <button onClick={() => apiPost("/data/refresh-health").then(() => query.refetch())}>Refresh</button>
         </div>
